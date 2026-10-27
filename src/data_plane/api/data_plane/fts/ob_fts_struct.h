@@ -30,8 +30,9 @@ namespace storage
 class ObFTWord final
 {
 public:
-  ObFTWord() : word_(), meta_() {}
-  ObFTWord(const int64_t length, const char *ptr, const ObObjMeta &meta) : meta_(meta)
+  ObFTWord() : word_(), meta_(), hash_value_(0), hash_valid_(false) {}
+  ObFTWord(const int64_t length, const char *ptr, const ObObjMeta &meta)
+      : meta_(meta), hash_value_(0), hash_valid_(false)
   {
     word_.set_string(ptr, length);
   }
@@ -49,6 +50,11 @@ public:
 private:
   ObDatum word_;
   ObObjMeta meta_;
+  // The word buffer is immutable once the key is built, so the (collation aware, relatively
+  // expensive) hash only has to be computed once even though the word map probes it several
+  // times (lookup + insert) per token.
+  mutable uint64_t hash_value_;
+  mutable bool hash_valid_;
 };
 
 typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
