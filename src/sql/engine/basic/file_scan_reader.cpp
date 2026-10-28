@@ -81,6 +81,92 @@ bool FileScanReader::canonical_path(const std::string &input, std::string &outpu
   return true;
 }
 
+bool FileScanReader::canonical_glob(const std::string &input, std::string &output, std::string &error)
+{
+  if (input.empty() || input.find('\0') != std::string::npos) {
+    error = "empty path or embedded NUL";
+    return false;
+  }
+  const size_t separator = input.find_last_of("/\\");
+  const std::string directory = separator == std::string::npos ? "." : input.substr(0, separator);
+  const std::string pattern = separator == std::string::npos ? input : input.substr(separator + 1);
+  if (pattern.empty() || pattern == "." || pattern == "..") {
+    error = "glob requires a file pattern";
+    return false;
+  }
+  if (pattern.find_first_of("/\\") != std::string::npos) {
+    error = "glob pattern must match one file name";
+    return false;
+  }
+  std::error_code ec;
+  const auto resolved = std::filesystem::canonical(std::filesystem::u8path(directory), ec);
+  if (ec) { error = "cannot resolve glob directory: " + ec.message(); return false; }
+  if (!std::filesystem::is_directory(resolved, ec) || ec) {
+    error = "glob directory is not a directory";
+    return false;
+  }
+  std::string base;
+  const std::u8string encoded = resolved.u8string();
+  base.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+#ifdef _WIN32
+  output = base + "\\" + pattern;
+#else
+  output = base + "/" + pattern;
+#endif
+  return true;
+}
+
+namespace {
+bool glob_match(const char *pattern, const char *name)
+{
+  const char *star = nullptr;
+  const char *resume = nullptr;
+  while (*name) {
+    if (*pattern == '?' || *pattern == *name) {
+      ++pattern;
+      ++name;
+    } else if (*pattern == '*') {
+      star = pattern++;
+      resume = name;
+    } else if (star != nullptr) {
+      pattern = star + 1;
+      name = ++resume;
+    } else {
+      return false;
+    }
+  }
+  while (*pattern == '*') ++pattern;
+  return *pattern == '\0';
+}
+}  // namespace
+
+bool FileScanReader::expand_glob()
+{
+  glob_matches_.clear();
+  glob_index_ = 0;
+  const size_t separator = path_.find_last_of("/\\");
+  const std::string directory = separator == std::string::npos ? "." : path_.substr(0, separator);
+  const std::string pattern = separator == std::string::npos ? path_ : path_.substr(separator + 1);
+  std::error_code ec;
+  std::filesystem::directory_iterator iterator(std::filesystem::u8path(directory), ec);
+  if (ec) return fail("cannot list glob directory: " + ec.message());
+  for (const auto &entry : iterator) {
+    std::error_code entry_error;
+    if (!entry.is_regular_file(entry_error) || entry_error) continue;
+    std::string name;
+    const std::u8string encoded = entry.path().filename().u8string();
+    name.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+    if (!glob_match(pattern.c_str(), name.c_str())) continue;
+    std::string full;
+    const std::u8string path = entry.path().u8string();
+    full.assign(reinterpret_cast<const char *>(path.data()), path.size());
+    for (char &c : full) if (c == '\\') c = '/';
+    glob_matches_.push_back(std::move(full));
+  }
+  std::sort(glob_matches_.begin(), glob_matches_.end());
+  return true;
+}
+
 bool FileScanReader::fingerprint(std::string &value)
 {
 #ifdef _WIN32
@@ -112,7 +198,17 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
   columns_.clear();
   row_count_ = 0;
   line_ = 1;
-  if (format != "csv" && format != "jsonl") return fail("unsupported file format");
+  glob_matches_.clear();
+  glob_index_ = 0;
+  if (format != "csv" && format != "jsonl" && format != "glob") return fail("unsupported file format");
+  if (format == "glob") {
+    if (!expand_glob()) return false;
+    columns_.clear();
+    columns_.push_back({"file", FileColumnType::VARCHAR, static_cast<int64_t>(glob_matches_.size())});
+    row_count_ = static_cast<int64_t>(glob_matches_.size());
+    glob_index_ = 0;
+    return true;
+  }
   if (!options.delimiter || !options.quote || options.delimiter == options.quote
       || options.delimiter == '\n' || options.delimiter == '\r'
       || options.quote == '\n' || options.quote == '\r') return fail("invalid CSV delimiter or quote");
@@ -129,10 +225,13 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
 void FileScanReader::close()
 {
   if (file_) { fclose(file_); file_ = nullptr; }
+  glob_matches_.clear();
+  glob_index_ = 0;
 }
 
 bool FileScanReader::check_unchanged()
 {
+  if (format_ == "glob") return true;
   std::string current;
   return file_ && fingerprint(current) && (current == signature_ || fail("file changed while scanning"));
 }
@@ -267,6 +366,10 @@ bool FileScanReader::skip_header()
 
 bool FileScanReader::rewind()
 {
+  if (format_ == "glob") {
+    glob_index_ = 0;
+    return true;
+  }
   if (!check_unchanged() || fseek(file_, 0, SEEK_SET) != 0) return fail("cannot rewind unchanged file");
   clearerr(file_); line_ = 1;
   return skip_header();
@@ -312,6 +415,12 @@ FileColumnType FileScanReader::widen(FileColumnType left, FileColumnType right)
 bool FileScanReader::infer()
 {
   columns_.clear(); row_count_ = 0;
+  if (format_ == "glob") {
+    if (!expand_glob()) return false;
+    columns_.push_back({"file", FileColumnType::VARCHAR, static_cast<int64_t>(glob_matches_.size())});
+    row_count_ = static_cast<int64_t>(glob_matches_.size());
+    return rewind();
+  }
   if (!file_ || fseek(file_, 0, SEEK_SET) != 0) return fail("file is not open");
   unsigned char bom[3];
   const size_t count = fread(bom, 1, sizeof(bom), file_);
@@ -363,6 +472,15 @@ bool FileScanReader::infer()
 
 bool FileScanReader::next(std::vector<FileCell> &row, bool &eof)
 {
+  if (format_ == "glob") {
+    eof = glob_index_ >= glob_matches_.size();
+    if (eof) return true;
+    FileCell cell;
+    cell.text = glob_matches_[glob_index_++];
+    cell.is_null = false;
+    row.assign(1, std::move(cell));
+    return true;
+  }
   if (!check_unchanged()) return false;
   std::vector<std::string> names;
   std::vector<FileCell> values;

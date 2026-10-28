@@ -57,6 +57,7 @@ public:
   const std::string &signature() const { return signature_; }
   const std::string &path() const { return path_; }
   static bool canonical_path(const std::string &input, std::string &output, std::string &error);
+  static bool canonical_glob(const std::string &input, std::string &output, std::string &error);
   static FileColumnType infer_type(const std::string &text);
   static FileColumnType widen(FileColumnType left, FileColumnType right);
 
@@ -67,6 +68,7 @@ private:
   bool read_record(std::vector<std::string> &names, std::vector<FileCell> &row, bool &eof);
   bool skip_header();
   bool fingerprint(std::string &value);
+  bool expand_glob();
   FILE *file_ = nullptr;
   std::string path_;
   std::string format_;
@@ -74,6 +76,8 @@ private:
   std::string signature_;
   FileReadOptions options_;
   std::vector<FileColumn> columns_;
+  std::vector<std::string> glob_matches_;
+  size_t glob_index_ = 0;
   int64_t line_ = 1;
   int64_t row_count_ = 0;
 };
