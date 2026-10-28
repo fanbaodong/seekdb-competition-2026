@@ -6790,7 +6790,7 @@
     "base_value": "0",
     "data_type": "bool",
     "info": "mock for mysql5.7",
-    "flags": "SESSION | GLOBAL | MYSQL_ONLY",
+    "flags": "SESSION | MYSQL_ONLY",
     "publish_version": "425",
     "info_cn": "",
     "background_cn": "",
@@ -10973,6 +10973,21 @@
     "max_val": "100",
     "publish_version": "1.0.0.0",
     "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10754,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Reject reads of AI columns while their generated values are not ready.",
+    "flags": "SESSION | GLOBAL | MYSQL_ONLY",
+    "min_val": "0",
+    "max_val": "1",
+    "publish_version": "1.0.0.0",
+    "info_cn": "当 AI 列结果未就绪时拒绝读取",
     "background_cn": "",
     "ref_url": ""
   }
