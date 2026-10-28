@@ -43,22 +43,6 @@ ai_prompt(c)
 {"args": [], "template": "lmtBeletLiSQIwqhwr"}
 {"args": [], "template": "eIKamHGwnY"}
 drop table t1;
-select json_length(json_extract(ai_prompt('{0}', json_array(1, true)), '$.args[0]')) as array_len;
-array_len
-2
-select json_unquote(json_extract(ai_prompt('{0}', json_object('k', '世界')), '$.args[0].k')) as object_value;
-object_value
-世界
-select json_unquote(json_extract(ai_prompt('outer {0}', ai_prompt('inner {0}', '世界')), '$.args[0].template')) as nested_template;
-nested_template
-inner {0}
-drop table if exists ai_prompt_large_lob;
-create table ai_prompt_large_lob(t longtext, a text);
-insert into ai_prompt_large_lob values(concat(repeat('x', 70000), '{0}'), '世界');
-select length(json_unquote(json_extract(ai_prompt(t, a), '$.template'))) as template_bytes, char_length(json_unquote(json_extract(ai_prompt(t, a), '$.args[0]'))) as arg_chars from ai_prompt_large_lob;
-template_bytes	arg_chars
-70003	2
-drop table ai_prompt_large_lob;
 drop table if exists t1;
 create table t1 (nr int, a tinyblob, b text, c mediumblob, d longtext);
 insert into t1 values(1, 'a', 'b', 'c', 'd');

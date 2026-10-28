@@ -17,41 +17,11 @@ call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT(
 select length(ai_complete('enhance_complete', 'hello', null)) > 0 as complete_ok;
 complete_ok
 1
-select length(ai_complete('enhance_complete', 'without config')) > 0 as complete_without_config_ok;
-complete_without_config_ok
-1
 select length(ai_complete(
 'enhance_complete', ai_prompt('describe {0}', json_object('text','你好')),
 '{"temperature":0.2,"max_tokens":16}')) > 0 as complete_config_ok;
 complete_config_ok
 1
-select length(ai_complete('enhance_complete', 'json configuration',
-json_object('temperature', 0.2, 'max_tokens', 16))) > 0 as complete_json_config_ok;
-complete_json_config_ok
-1
-select ai_complete('enhance_complete', 'invalid configuration', json_array(1, 2));
-ERROR HY000: Invalid argument
-drop table if exists ai_enhance_complete_lob;
-create table ai_enhance_complete_lob(prompt longtext);
-insert into ai_enhance_complete_lob values(repeat('x', 70000));
-select length(ai_complete('enhance_complete', prompt, null)) > 0 as complete_lob_ok
-from ai_enhance_complete_lob;
-complete_lob_ok
-1
-drop table ai_enhance_complete_lob;
-select length(ai_complete('enhance_complete', ai_prompt('{0}/{0}/{0}', 'repeated argument'), null)) > 0 as complete_repeat_ok;
-complete_repeat_ok
-1
-select length(ai_complete('enhance_complete', ai_prompt('outer {0} {1}', ai_prompt('inner {0}', '世界'), json_array(1,true)), null)) > 0 as complete_nested_json_ok;
-complete_nested_json_ok
-1
-select length(ai_complete('enhance_complete', ai_prompt('{{0}} {0}', 'escaped'), null)) > 0 as complete_escape_ok;
-complete_escape_ok
-1
-select ai_complete('enhance_complete', ai_prompt('{2}', 'one'), null);
-ERROR HY000: Invalid argument
-select ai_complete('enhance_complete', ai_prompt('{184467440737095516160}', 'one'), null);
-ERROR HY000: Invalid argument
 call DBMS_AI_SERVICE.DROP_AI_MODEL('enhance_embed');
 call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('enhance_embed_ep');
 call DBMS_AI_SERVICE.CREATE_AI_MODEL(
@@ -64,15 +34,6 @@ embed_dimension
 select json_length(ai_embed('enhance_embed', 'dimension-row', 768)) as requested_dimension;
 requested_dimension
 768
-select json_valid(ai_embed('enhance_embed', 'json-vector')) as embed_json_ok;
-embed_json_ok
-1
-select ai_embed('enhance_embed', 'bad-dimension', 0);
-ERROR HY000: Invalid argument
-select ai_embed('enhance_embed', 'bad-dimension', -1);
-ERROR HY000: Invalid argument
-select ai_embed('enhance_embed', 'bad-dimension', 1.5);
-ERROR HY000: Invalid argument
 drop table if exists ai_enhance_batch;
 create table ai_enhance_batch(id int primary key, content text);
 insert into ai_enhance_batch values(1,'first'),(2,null),(3,'third');

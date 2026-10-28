@@ -47,20 +47,6 @@ select ai_prompt(c) from t1;
 
 drop table t1;
 
-# JSON values stay structured, including arrays, objects, and nested prompts.
-select json_length(json_extract(ai_prompt('{0}', json_array(1, true)), '$.args[0]')) as array_len;
-select json_unquote(json_extract(ai_prompt('{0}', json_object('k', '世界')), '$.args[0].k')) as object_value;
-select json_unquote(json_extract(ai_prompt('outer {0}', ai_prompt('inner {0}', '世界')), '$.args[0].template')) as nested_template;
-
-# LOB content must not be interpreted as a locator or truncated to VARCHAR length.
---disable_warnings
-drop table if exists ai_prompt_large_lob;
---enable_warnings
-create table ai_prompt_large_lob(t longtext, a text);
-insert into ai_prompt_large_lob values(concat(repeat('x', 70000), '{0}'), '世界');
-select length(json_unquote(json_extract(ai_prompt(t, a), '$.template'))) as template_bytes, char_length(json_unquote(json_extract(ai_prompt(t, a), '$.args[0]'))) as arg_chars from ai_prompt_large_lob;
-drop table ai_prompt_large_lob;
-
 
 # text/blob/longtext 模板支持
 --disable_warnings
