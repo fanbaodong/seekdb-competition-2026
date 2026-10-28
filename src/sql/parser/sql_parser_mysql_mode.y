@@ -299,6 +299,7 @@ END_P SET_VAR DELIMITER
         INVISIBLE MERGE ISNULL INTERSECT INCREMENTAL INNER_PARSE ILOGCACHE INPUT INDEXED INCONSISTENT INDIVIDUAL
 
         JOB JSON JSON_ARRAYAGG JSON_OBJECTAGG JSON_QUERY JSON_VALUE JSON_TABLE
+        READ_CSV READ_JSON READ_NDJSON READ_PARQUET GLOB
 
         KEYWORD KEY_BLOCK_SIZE KEY_VERSION KVCACHE
 
@@ -498,6 +499,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%type <node> file_table_expr file_table_name file_table_options file_table_option_list file_table_option file_table_alias
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -10835,6 +10837,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 | '(' table_references ')'
 {
   $$ = $2;
@@ -16624,6 +16630,61 @@ DAY
 *  JSON TABLE
 *============================================================*/
 
+file_table_name:
+READ_CSV { make_name_node($$, result->malloc_pool_, "csv"); }
+| READ_JSON { make_name_node($$, result->malloc_pool_, "jsonl"); }
+| READ_NDJSON { make_name_node($$, result->malloc_pool_, "jsonl"); }
+| READ_PARQUET { make_name_node($$, result->malloc_pool_, "parquet"); }
+| GLOB { make_name_node($$, result->malloc_pool_, "glob"); }
+;
+
+file_table_alias:
+/* empty */ %prec LOWER_PARENS { $$ = NULL; }
+| relation_name { $$ = $1; }
+| AS relation_name { $$ = $2; }
+;
+
+file_table_expr:
+file_table_name '(' literal ')' file_table_alias
+{
+  $3->is_forbid_parameter_ = true;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 4, $1, $3, NULL, $5);
+}
+| file_table_name '(' literal ',' file_table_option_list ')' file_table_alias
+{
+  ParseNode *options = NULL;
+  $3->is_forbid_parameter_ = true;
+  merge_nodes(options, result, T_EXPR_LIST, $5);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 4, $1, $3, options, $7);
+}
+;
+
+file_table_options:
+/* empty */ { $$ = NULL; }
+| ',' file_table_option_list { merge_nodes($$, result, T_EXPR_LIST, $2); }
+;
+
+file_table_option_list:
+file_table_option { $$ = $1; }
+| file_table_option_list ',' file_table_option
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+
+file_table_option:
+relation_name COMP_EQ literal
+{
+  $3->is_forbid_parameter_ = true;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3);
+}
+| relation_name COMP_EQ '-' INTNUM
+{
+  ParseNode *negative = NULL;
+  $4->is_forbid_parameter_ = true;
+  malloc_non_terminal_node(negative, result->malloc_pool_, T_OP_NEG, 1, $4);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, negative);
+}
+;
+
 json_table_expr:
 JSON_TABLE '(' simple_expr ',' literal mock_jt_on_error_on_empty COLUMNS '(' jt_column_list ')' ')' relation_name
 {
@@ -17753,6 +17814,11 @@ ACCOUNT
 |       JSON_OBJECTAGG
 |       JSON_QUERY
 |       JSON_TABLE
+|       READ_CSV
+|       READ_JSON
+|       READ_NDJSON
+|       READ_PARQUET
+|       GLOB
 |       KEYWORD
 |       KEY_BLOCK_SIZE
 |       KEY_VERSION
