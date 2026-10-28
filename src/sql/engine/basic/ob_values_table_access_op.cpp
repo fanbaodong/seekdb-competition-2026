@@ -387,7 +387,10 @@ int ObValuesTableAccessOp::open_file_scan()
   };
   if (OB_SUCC(ret)) {
     std::string canonical, error;
-    if (!FileScanReader::canonical_path(text(FILE_PATH), canonical, error)) {
+    const bool resolved = text(FILE_FORMAT) == "glob"
+        ? FileScanReader::canonical_glob(text(FILE_PATH), canonical, error)
+        : FileScanReader::canonical_path(text(FILE_PATH), canonical, error);
+    if (!resolved) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.c_str());
     } else if (canonical != text(FILE_PATH)) {
