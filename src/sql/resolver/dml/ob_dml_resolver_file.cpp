@@ -40,7 +40,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   } else if (OB_FAIL(resolve_str_const(*node.children_[1], path))) {
   } else {
     format.assign(node.children_[0]->str_value_, node.children_[0]->str_len_);
-    if (format != "csv" && format != "jsonl") {
+    if (format != "csv" && format != "jsonl" && format != "glob") {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file scan format");
     }
@@ -86,7 +86,11 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   }
   LOG_WARN("file_sql chain done", K(ret), K(canonical.c_str()), K(secure_path));
   if (OB_SUCC(ret)) {
-    if (!FileScanReader::canonical_path(std::string(path.ptr(), path.length()), canonical, error)) {
+    const std::string raw_path(path.ptr() ? path.ptr() : "", path.length());
+    const bool resolved = format == "glob"
+        ? FileScanReader::canonical_glob(raw_path, canonical, error)
+        : FileScanReader::canonical_path(raw_path, canonical, error);
+    if (!resolved) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.c_str());
     } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_path))) {
