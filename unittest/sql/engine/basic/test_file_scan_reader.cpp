@@ -14,11 +14,15 @@ int main()
   const auto root = std::filesystem::temp_directory_path() /
       ("seekdb_file_reader_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   REQUIRE(std::filesystem::create_directory(root));
+  const auto utf8 = [](const std::filesystem::path &path) {
+    const auto encoded = path.u8string();
+    return std::string(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+  };
   const auto write = [&](const char *name, const std::string &data) {
     std::ofstream out(root / name, std::ios::binary);
     out.write(data.data(), static_cast<std::streamsize>(data.size()));
     REQUIRE(out.good());
-    return (root / name).u8string();
+    return utf8(root / name);
   };
   FileScanReader reader;
   FileReadOptions options;
@@ -58,8 +62,23 @@ int main()
   REQUIRE(!reader.next(row, eof));
   reader.close();
   std::string canonical, error;
-  REQUIRE(!FileScanReader::canonical_path(root.u8string(), canonical, error));
+  REQUIRE(!FileScanReader::canonical_path(utf8(root), canonical, error));
   REQUIRE(FileScanReader::canonical_path(csv, canonical, error));
+  REQUIRE(FileScanReader::canonical_glob(utf8(root / "*.csv"), canonical, error));
+  REQUIRE(reader.open(canonical, "glob", options) && reader.infer());
+  int64_t files = 0;
+  while (reader.next(row, eof) && !eof) {
+    REQUIRE(row.size() == 1 && !row[0].is_null && row[0].text.find(".csv") != std::string::npos);
+    ++files;
+  }
+  REQUIRE(eof && files == 4);
+  REQUIRE(reader.rewind() && reader.next(row, eof) && !eof);
+  reader.close();
+  // Root-directory patterns must retain the filesystem root when canonicalized.
+  const auto root_pattern = root.root_path() / "__seekdb_no_such_file__*";
+  REQUIRE(FileScanReader::canonical_glob(utf8(root_pattern), canonical, error));
+  REQUIRE(std::filesystem::u8path(canonical).parent_path() == root.root_path());
+  REQUIRE(std::filesystem::canonical(root).parent_path() == std::filesystem::canonical(std::filesystem::temp_directory_path()));
   std::filesystem::remove_all(root);
   puts("file_scan_reader: PASS");
   return 0;
