@@ -74,41 +74,21 @@ void ObStopWordChecker::destroy()
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
 {
   int ret = OB_SUCCESS;
-  
-  
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    const common::ObString input_str = word.get_word().get_string();
     common::ObString cmp_str;
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     if (word.get_collation_type() == stopword_type_.get_collation_type()) {
-      // No transcoding or temporary arena is needed for identical collations.
-      cmp_str = input_str;
-    } else {
-      common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
-      if (OB_FAIL(common::ObCharset::charset_convert(
-              allocator, input_str, word.get_collation_type(),
-              stopword_type_.get_collation_type(), cmp_str))) {
-      } else {
-        ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-        ret = stopword_set_.exist_refactored(converted);
-      }
-      // The converted string must be consumed while its arena is still alive.
-      if (OB_SUCC(ret) || OB_HASH_EXIST == ret || OB_HASH_NOT_EXIST == ret) {
-        if (OB_HASH_NOT_EXIST == ret) {
-          is_stopword = false;
-          ret = OB_SUCCESS;
-        } else if (OB_HASH_EXIST == ret) {
-          is_stopword = true;
-          ret = OB_SUCCESS;
-        } else {
-          ret = OB_ERR_UNEXPECTED;
-        }
-      }
+      // Identical collations need neither conversion nor an allocated buffer.
+      cmp_str = word.get_word().get_string();
+    } else if (OB_FAIL(common::ObCharset::charset_convert(
+                   allocator, word.get_word().get_string(),
+                   word.get_collation_type(), stopword_type_.get_collation_type(), cmp_str))) {
     }
-    if (OB_SUCC(ret) && word.get_collation_type() == stopword_type_.get_collation_type()) {
+    if (OB_SUCC(ret)) {
       ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
       ret = stopword_set_.exist_refactored(converted);
       if (OB_HASH_NOT_EXIST == ret) {
