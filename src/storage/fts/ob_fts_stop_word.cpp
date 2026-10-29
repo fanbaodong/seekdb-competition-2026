@@ -165,15 +165,37 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
+    const ObString &src_str = src.get_word().get_string();
+    const bool utf8 = ObCharset::charset_type_by_coll(word_meta_.get_collation_type()) == CHARSET_UTF8MB4;
+    bool already_lower_ascii = utf8;
+    for (int64_t i = 0; already_lower_ascii && i < src_str.length(); ++i) {
+      const unsigned char ch = static_cast<unsigned char>(src_str.ptr()[i]);
+      if (ch >= 0x80 || (ch >= 'A' && ch <= 'Z')) {
+        already_lower_ascii = false;
+      }
+    }
+    if (already_lower_ascii) {
+      // Preserve the allocator-owned lifetime of the generic tolower path.
+      // ASCII without uppercase bytes is already normalized.
+      char *buf = static_cast<char *>(allocator_.alloc(src_str.length()));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(buf, src_str.ptr(), src_str.length());
+        ObFTWord tmp(src_str.length(), buf, word_meta_);
+        dst = tmp;
+      }
     } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(
+                      word_meta_.get_collation_type(),
+                      src_str,
+                      dst_str,
+                      allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
     }
   } else {
     dst = src;

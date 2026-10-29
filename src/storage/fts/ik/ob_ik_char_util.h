@@ -177,6 +177,10 @@ private:
     if (OB_ISNULL(input)) {
       ret = OB_INVALID_ARGUMENT;
       STORAGE_FTS_LOG(WARN, "Invalid input", K(input), K(ret));
+    } else if (CS_TYPE == CHARSET_UTF8MB4 && char_len == 1
+               && static_cast<unsigned char>(input[0]) < 0x80) {
+      // ASCII's Unicode code point equals its single UTF-8 byte.
+      unicode = static_cast<unsigned char>(input[0]);
     } else {
       const unsigned char *ustart = reinterpret_cast<const unsigned char *>(input);
       const unsigned char *uend = reinterpret_cast<const unsigned char *>(&input[char_len]);
