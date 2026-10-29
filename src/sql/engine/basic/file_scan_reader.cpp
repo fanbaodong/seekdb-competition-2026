@@ -76,7 +76,7 @@ bool FileScanReader::canonical_path(const std::string &input, std::string &outpu
     error = "only regular local files are supported";
     return false;
   }
-  const std::u8string encoded = resolved.u8string();
+  const auto encoded = resolved.u8string();
   output.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
   return true;
 }
@@ -88,7 +88,9 @@ bool FileScanReader::canonical_glob(const std::string &input, std::string &outpu
     return false;
   }
   const size_t separator = input.find_last_of("/\\");
-  const std::string directory = separator == std::string::npos ? "." : input.substr(0, separator);
+  const size_t directory_length = separator == 0 ? 1 :
+      (separator == 2 && input[1] == ':' ? 3 : separator);
+  const std::string directory = separator == std::string::npos ? "." : input.substr(0, directory_length);
   const std::string pattern = separator == std::string::npos ? input : input.substr(separator + 1);
   if (pattern.empty() || pattern == "." || pattern == "..") {
     error = "glob requires a file pattern";
@@ -106,7 +108,7 @@ bool FileScanReader::canonical_glob(const std::string &input, std::string &outpu
     return false;
   }
   std::string base;
-  const std::u8string encoded = resolved.u8string();
+  const auto encoded = resolved.u8string();
   base.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
 #ifdef _WIN32
   output = base + "\\" + pattern;
@@ -145,24 +147,36 @@ bool FileScanReader::expand_glob()
   glob_matches_.clear();
   glob_index_ = 0;
   const size_t separator = path_.find_last_of("/\\");
-  const std::string directory = separator == std::string::npos ? "." : path_.substr(0, separator);
+  const size_t directory_length = separator == 0 ? 1 :
+      (separator == 2 && path_[1] == ':' ? 3 : separator);
+  const std::string directory = separator == std::string::npos ? "." : path_.substr(0, directory_length);
   const std::string pattern = separator == std::string::npos ? path_ : path_.substr(separator + 1);
   std::error_code ec;
   std::filesystem::directory_iterator iterator(std::filesystem::u8path(directory), ec);
   if (ec) return fail("cannot list glob directory: " + ec.message());
-  for (const auto &entry : iterator) {
+  size_t total_bytes = 0;
+  for (const std::filesystem::directory_iterator end; iterator != end; iterator.increment(ec)) {
+    if (ec) return fail("cannot continue glob directory scan: " + ec.message());
+    const auto &entry = *iterator;
     std::error_code entry_error;
+    // Do not expose paths to targets outside the checked directory via symlinks.
+    if (entry.is_symlink(entry_error) || entry_error) continue;
     if (!entry.is_regular_file(entry_error) || entry_error) continue;
     std::string name;
-    const std::u8string encoded = entry.path().filename().u8string();
+    const auto encoded = entry.path().filename().u8string();
     name.assign(reinterpret_cast<const char *>(encoded.data()), encoded.size());
     if (!glob_match(pattern.c_str(), name.c_str())) continue;
     std::string full;
-    const std::u8string path = entry.path().u8string();
+    const auto path = entry.path().u8string();
     full.assign(reinterpret_cast<const char *>(path.data()), path.size());
     for (char &c : full) if (c == '\\') c = '/';
+    total_bytes += full.size();
+    if (glob_matches_.size() >= 100000 || total_bytes > MAX_RECORD_BYTES) {
+      return fail("glob result exceeds the 100000-file or 16 MiB path limit");
+    }
     glob_matches_.push_back(std::move(full));
   }
+  if (ec) return fail("cannot continue glob directory scan: " + ec.message());
   std::sort(glob_matches_.begin(), glob_matches_.end());
   return true;
 }
@@ -175,6 +189,10 @@ bool FileScanReader::fingerprint(std::string &value)
 #else
   struct stat st;
   if (fstat(fileno(file_), &st) != 0) return fail("cannot stat open file");
+  struct stat named;
+  if (stat(path_.c_str(), &named) != 0 || named.st_dev != st.st_dev || named.st_ino != st.st_ino) {
+    return fail("file was replaced while scanning");
+  }
 #endif
   std::error_code ec;
   const auto path = std::filesystem::u8path(path_);
@@ -195,6 +213,7 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
   format_ = format;
   options_ = options;
   error_.clear();
+  signature_.clear();
   columns_.clear();
   row_count_ = 0;
   line_ = 1;

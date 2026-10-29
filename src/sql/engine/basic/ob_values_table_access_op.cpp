@@ -460,8 +460,9 @@ int ObValuesTableAccessOp::next_file_row()
         converted.set_varchar(ObString(static_cast<int32_t>(cell.text.size()), cell.text.data()));
         converted.set_collation_type(CS_TYPE_UTF8MB4_BIN);
       } else {
-        if (cell.text == "true" || cell.text == "TRUE" || cell.text == "True") source.set_int(1);
-        else if (cell.text == "false" || cell.text == "FALSE" || cell.text == "False") source.set_int(0);
+        const ObString token(static_cast<int32_t>(cell.text.size()), cell.text.data());
+        if (token.case_compare("true") == 0) source.set_int(1);
+        else if (token.case_compare("false") == 0) source.set_int(0);
         else {
           if (expr->obj_meta_.get_type() == ObDateTimeType && cell.text.size() > 10 && cell.text[10] == 'T') cell.text[10] = ' ';
           source.set_varchar(ObString(static_cast<int32_t>(cell.text.size()), cell.text.data()));

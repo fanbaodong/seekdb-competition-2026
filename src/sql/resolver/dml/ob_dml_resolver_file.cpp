@@ -19,14 +19,6 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   std::string canonical, error, format;
   TableItem *item = nullptr;
   ObValuesTableDef *def = nullptr;
-  if (node.num_child_ == 4) {
-    LOG_WARN("file_sql parse node",
-             K(static_cast<int>(node.type_)),
-             K(node.children_[0] ? static_cast<int>(node.children_[0]->type_) : -1),
-             K(node.children_[1] ? static_cast<int>(node.children_[1]->type_) : -1),
-             K(node.children_[2] ? static_cast<int>(node.children_[2]->type_) : -1),
-             K(node.children_[3] ? static_cast<int>(node.children_[3]->type_) : -1));
-  }
   if (OB_ISNULL(session_info_) || OB_ISNULL(allocator_) || OB_ISNULL(get_stmt())
       || node.num_child_ != 4 || !node.children_[0] || !node.children_[1]) {
     ret = OB_ERR_UNEXPECTED;
@@ -84,7 +76,6 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
       }
     }
   }
-  LOG_WARN("file_sql chain done", K(ret), K(canonical.c_str()), K(secure_path));
   if (OB_SUCC(ret)) {
     const std::string raw_path(path.ptr() ? path.ptr() : "", path.length());
     const bool resolved = format == "glob"
@@ -109,7 +100,6 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
       } else { def = new (memory) ObValuesTableDef(); item->values_table_def_ = def; }
     }
   }
-  LOG_WARN("file_sql after item", K(ret), K(item));
   const auto add_metadata = [&](const std::string &text) -> int {
     ObString copied;
     int code = ob_write_string(*allocator_, ObString(static_cast<int32_t>(text.size()), text.data()), copied);
@@ -166,6 +156,9 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
     } else if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_REF_COLUMN, expr))) {
     } else {
       expr->set_result_type(type);
+      if (def->row_cnt_ > 0 && column.non_null_count == def->row_cnt_) {
+        expr->set_result_flag(expr->get_result_flag() | NOT_NULL_FLAG);
+      }
       expr->set_ref_id(item->table_id_, i + OB_APP_MIN_COLUMN_ID);
       expr->set_column_attr(item->table_name_, name);
       if (OB_FAIL(expr->add_flag(IS_COLUMN))) {
