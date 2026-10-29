@@ -584,6 +584,10 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else if (relevance_expr_) {
     score = relevance_[cur_idx_];
+  } else {
+    // With no score projection, a posting means that the natural-language
+    // token is present. The boolean MATCH filter only needs a nonzero value.
+    score = 1.0;
   }
   return ret;
 }
