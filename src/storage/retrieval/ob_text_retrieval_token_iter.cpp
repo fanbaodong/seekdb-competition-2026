@@ -72,26 +72,19 @@ int ObTextRetrievalTokenIter::init(const ObTextRetrievalScanIterParam &iter_para
       OB_ISNULL(inv_scan_domain_id_col_) || OB_ISNULL(allocator_) || OB_ISNULL(mem_context_.ref_context())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("inv_idx_scan_iter or eval_ctx is NULL", K(ret), K_(inv_idx_scan_iter), KPC_(eval_ctx), KPC_(inv_idx_scan_param), KP(allocator_), KP(mem_context_.ref_context()));
-  } else if (need_calc_relevance()) {
-    if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
-    }
+  } else if (!need_calc_relevance()) {
+  } else if (OB_ISNULL(relevance_expr_) || OB_ISNULL(inv_idx_agg_expr_) || OB_ISNULL(inv_idx_agg_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(inv_scan_doc_length_col_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(init_calc_exprs_in_relevance_expr())) {
+  } else if (OB_ISNULL(skip_ = sql::to_bit_vector(
+                           allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    skip_->init(max_batch_size_);
   }
-  // Both the relevance and the doc-id-only path use the skip bitmap.
-  if (OB_SUCC(ret)) {
-    if (OB_ISNULL(skip_ = sql::to_bit_vector(
-            allocator_->alloc(sql::ObBitVector::memory_size(max_batch_size_))))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else {
-      skip_->init(max_batch_size_);
-    }
-  }
-  if (OB_SUCC(ret)) {
-    is_inited_ = true;
-  }
+  is_inited_ = true;
   return ret;
 }
 
@@ -103,10 +96,7 @@ void ObTextRetrievalTokenIter::reset()
 
 void ObTextRetrievalTokenIter::reuse()
 {
-  if (!need_calc_relevance()) {
-    // No posting statistics are required for a presence-only retrieval.
-  } else if (inv_idx_agg_cache_mode_ && nullptr != inv_idx_agg_param_
-             && !inv_idx_agg_param_->need_switch_param_) {
+  if (inv_idx_agg_cache_mode_ && !inv_idx_agg_param_->need_switch_param_) {
     // do nothing
   } else {
     token_doc_cnt_calculated_ = false;
@@ -213,8 +203,7 @@ int ObTextRetrievalTokenIter::get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (need_calc_relevance() && !token_doc_cnt_calculated_
-             && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_row(inv_idx_scan_iter_))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     }
@@ -253,8 +242,7 @@ int ObTextRetrievalTokenIter::get_next_batch(const int64_t capacity, int64_t &co
   count = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-  } else if (need_calc_relevance() && !token_doc_cnt_calculated_
-             && OB_FAIL(estimate_token_doc_cnt())) {
+  } else if (!token_doc_cnt_calculated_ && OB_FAIL(estimate_token_doc_cnt())) {
   } else if (OB_FAIL(query::das_scan_next_rows(
                  inv_idx_scan_iter_, count, OB_MIN(max_batch_size_, capacity)))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
@@ -596,10 +584,6 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else if (relevance_expr_) {
     score = relevance_[cur_idx_];
-  } else {
-    // With no score projection, a posting means that the natural-language
-    // token is present. The boolean MATCH filter only needs a nonzero value.
-    score = 1.0;
   }
   return ret;
 }
