@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -232,6 +233,92 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
       case T_MERGE_TABLE: {
         REGISTER_STMT_RESOLVER(MergeTable);
+        break;
+      }
+      case T_COPY: {
+        const ParseNode *select_node = real_parse_tree->children_[0];
+        const ParseNode *path_node = real_parse_tree->children_[1];
+        const ParseNode *option_list = real_parse_tree->children_[2];
+        ObSelectStmt *select_stmt = NULL;
+        if (OB_ISNULL(select_node) || OB_ISNULL(path_node)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(select_stmt_resolver_func<ObSelectResolver>(params_, *select_node, stmt))) {
+        } else if (OB_ISNULL(stmt) || !stmt->is_select_stmt()) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          bool has_header = false;
+          select_stmt = static_cast<ObSelectStmt *>(stmt);
+          for (int64_t i = 0; OB_SUCC(ret) && option_list && i < option_list->num_child_; ++i) {
+            const ParseNode *option = option_list->children_[i];
+            if (OB_ISNULL(option) || option->num_child_ < 1 || OB_ISNULL(option->children_[0])) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              std::string key(option->children_[0]->str_value_, option->children_[0]->str_len_);
+              for (char &c : key) if ('A' <= c && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+              if ("header" == key) {
+                has_header = true;
+              } else if ("format" == key) {
+                const ParseNode *value = option->num_child_ > 1 ? option->children_[1] : NULL;
+                std::string format(value && value->str_value_ ? value->str_value_ : "",
+                                   value && value->str_value_ ? value->str_len_ : 0);
+                for (char &c : format) if ('A' <= c && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                if ("csv" != format) {
+                  ret = OB_NOT_SUPPORTED;
+                  LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY format other than csv");
+                }
+              } else if ("nullstr" == key) {
+                // Accepted for DuckDB compatibility; the CSV writer prints NULL as text.
+              } else {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED, "this COPY option");
+              }
+            }
+          }
+          if (OB_SUCC(ret)) {
+            ObSelectIntoItem *into = static_cast<ObSelectIntoItem *>(
+                params_.allocator_->alloc(sizeof(ObSelectIntoItem)));
+            if (OB_ISNULL(into)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              new (into) ObSelectIntoItem();
+              ObString path_copy;
+              if (OB_FAIL(ob_write_string(*params_.allocator_,
+                                          ObString(path_node->str_len_, path_node->str_value_),
+                                          path_copy))) {
+              } else {
+                static const char *FIELD_TERM = ",";
+                static const char *LINE_TERM = "\n";
+                static const char QUOTE = '"';
+                into->into_type_ = T_INTO_OUTFILE;
+                into->outfile_name_.set_varchar(path_copy);
+                into->outfile_name_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+                into->field_str_.set_varchar(ObString::make_string(FIELD_TERM));
+                into->field_str_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+                into->line_str_.set_varchar(ObString::make_string(LINE_TERM));
+                into->line_str_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+                into->closed_cht_.set_char_value(&QUOTE, 1);
+                into->closed_cht_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+                into->is_optional_ = true;
+                for (int64_t i = 0; OB_SUCC(ret) && has_header
+                     && i < select_stmt->get_select_item_size(); ++i) {
+                  ObString name = select_stmt->get_select_item(i).alias_name_;
+                  if (name.empty()) {
+                    name = select_stmt->get_select_item(i).expr_name_;
+                  }
+                  ObString copied;
+                  if (name.empty()) {
+                    ret = OB_ERR_UNEXPECTED;
+                  } else if (OB_FAIL(ob_write_string(*params_.allocator_, name, copied))) {
+                  } else if (OB_FAIL(into->user_vars_.push_back(copied))) {
+                  }
+                }
+                if (OB_SUCC(ret)) {
+                  select_stmt->set_select_into(into);
+                }
+              }
+            }
+          }
+        }
         break;
       }
       case T_SELECT: {
