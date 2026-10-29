@@ -383,6 +383,7 @@ END_P SET_VAR DELIMITER
 %type <node> subpartition_template_option subpartition_individual_option opt_hash_partition_list hash_partition_list hash_partition_element opt_hash_subpartition_list hash_subpartition_list hash_subpartition_element opt_subpartition_list opt_engine_option
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
+%type <node> ai_column_with_options ai_column_option_list ai_column_option
 %type <node> explain_stmt explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
 %type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
 %type <node> column_ref multi_delete_table
@@ -4877,6 +4878,25 @@ column_definition_ref data_type opt_column_attribute_list opt_column_reference o
 }
 ;
 
+ai_column_with_options:
+/* empty */ { $$ = NULL; }
+| WITH '(' ai_column_option_list ')' { merge_nodes($$, result, T_EXPR_LIST, $3); }
+;
+
+ai_column_option_list:
+ai_column_option { $$ = $1; }
+| ai_column_option_list ',' ai_column_option
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+
+ai_column_option:
+relation_name COMP_EQ literal
+{
+  $3->is_forbid_parameter_ = true;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3);
+}
+;
+
 constraint_definition:
 CONSTRAINT opt_constraint_name CHECK '(' expr ')' check_state
 {
@@ -6139,7 +6159,11 @@ column_attribute_list column_attribute
 }
 
 column_attribute:
-not NULLX
+AI COLUMN '(' expr ')' ai_column_with_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN, 2, $4, $6);
+}
+| not NULLX
 {
   (void)($1) ;
   (void)($2) ; /* make bison mute */

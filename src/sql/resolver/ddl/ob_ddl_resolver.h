@@ -882,6 +882,9 @@ protected:
   ObIndexType vec_index_type_;
   ObSemiStructEncodingType semistruct_encoding_type_;
 private:
+  // Names of AI columns already declared in the current DDL statement, used to
+  // reject AI columns whose prompt depends on another AI column.
+  common::ObSEArray<common::ObString, 8> ai_column_names_;
   template <typename STMT>
   DISALLOW_COPY_AND_ASSIGN(ObDDLResolver);
 };

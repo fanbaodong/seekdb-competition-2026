@@ -2093,6 +2093,25 @@ int ObDDLResolver::resolve_normal_column_attribute(ObColumnSchemaV2 &column,
         if (OB_FAIL(resolve_normal_column_attribute_constr_null(column, resolve_stat))) {
         }
         break;
+      case T_AI_COLUMN: {
+        ParseNode *ai_expr = attr_node->num_child_ > 0 ? attr_node->children_[0] : NULL;
+        ParseNode *ai_name = (ai_expr && ai_expr->num_child_ > 0) ? ai_expr->children_[0] : NULL;
+        if (OB_ISNULL(ai_expr) || T_FUN_SYS != ai_expr->type_ || OB_ISNULL(ai_name)
+            || OB_ISNULL(ai_name->str_value_)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column requires AI_COMPLETE or AI_EMBED");
+        } else {
+          const ObString func_name(ai_name->str_len_, ai_name->str_value_);
+          if (0 != func_name.case_compare("ai_complete")
+              && 0 != func_name.case_compare("ai_embed")) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column requires AI_COMPLETE or AI_EMBED");
+          } else if (OB_FAIL(ai_column_names_.push_back(column.get_column_name_str()))) {
+            SQL_RESV_LOG(WARN, "failed to record AI column name", K(ret), K(column));
+          }
+        }
+        break;
+      }
       case T_CONSTR_PRIMARY_KEY: {
         resolve_stat.is_primary_key_ = true;
         // primary key should not be nullable
