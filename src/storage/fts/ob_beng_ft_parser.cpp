@@ -49,32 +49,15 @@ int ObBEngFTParser::get_next_token(
     }
   } else if (OB_ISNULL(token.ptr_) || OB_UNLIKELY(0 >= token.len_ || 0 >= token_freq)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
-    // Tokens must remain valid after the parser is destroyed. Store their
-    // bytes in the caller's arena, but reserve one bounded chunk per document
-    // instead of making a separate allocator call for every small token.
-    if (nullptr == token_buffer_) {
-      token_buffer_capacity_ = MIN(static_cast<int64_t>(doc_.len_), static_cast<int64_t>(4096));
-      if (OB_ISNULL(token_buffer_ = static_cast<char *>(allocator_.alloc(token_buffer_capacity_)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-      }
-    }
-    if (OB_SUCC(ret)) {
-      if (static_cast<int64_t>(token.len_) <= token_buffer_capacity_ - token_buffer_used_) {
-        buf = token_buffer_ + token_buffer_used_;
-        token_buffer_used_ += token.len_;
-      } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(token.len_)))) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-      }
-    }
-    if (OB_SUCC(ret)) {
-      MEMCPY(buf, token.ptr_, token.len_);
-      word = buf;
-      word_len = token.len_;
-      char_len = token.len_;
-      word_freq = token_freq;
-      LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
-    }
+    MEMCPY(buf, token.ptr_, token.len_);
+    word = buf;
+    word_len = token.len_;
+    char_len = token.len_;
+    word_freq = token_freq;
+    LOG_DEBUG("succeed to add word", K(ObString(word_len, word)), K(word_freq));
   }
   return ret;
 }
@@ -127,11 +110,6 @@ void ObBEngFTParser::reset()
   english_analyzer_.reset();
   doc_.reset();
   token_stream_ = nullptr;
-  // Token storage is owned by allocator_ and may still be referenced by
-  // the word map after this parser has been freed.
-  token_buffer_ = nullptr;
-  token_buffer_capacity_ = 0;
-  token_buffer_used_ = 0;
   is_inited_ = false;
 }
 

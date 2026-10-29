@@ -365,23 +365,11 @@ int ObSRDaaTIterImpl::filter_on_demand(const int64_t count, const double relevan
       relevance_proj_datum.set_double(relevance);
       relevance_proj_expr->get_evaluated_flags(*eval_ctx).set(count);
       relevance_proj_expr->set_evaluated_projected(*eval_ctx);
-      // For a direct boolean MATCH predicate, the already computed BM25
-      // relevance is exactly the value consumed by ObExprBool. Re-evaluating
-      // the expression tree for every matching document is unnecessary.
-      if (filter_expr->type_ == T_OP_BOOL
-          && filter_expr->arg_cnt_ == 1
-          && OB_NOT_NULL(filter_expr->args_)
-          && filter_expr->args_[0] == relevance_proj_expr
-          && (relevance_proj_expr->datum_meta_.type_ == ObDoubleType
-              || relevance_proj_expr->datum_meta_.type_ == ObUDoubleType)) {
-        need_project = (0.0 != relevance);
+      ObDatum *filter_res = nullptr;
+      filter_expr->clear_evaluated_flag(*eval_ctx);
+      if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {
       } else {
-        ObDatum *filter_res = nullptr;
-        filter_expr->clear_evaluated_flag(*eval_ctx);
-        if (OB_FAIL(filter_expr->eval(*eval_ctx, filter_res))) {
-        } else {
-          need_project = !(filter_res->is_null() || 0 == filter_res->get_int());
-        }
+        need_project = !(filter_res->is_null() || 0 == filter_res->get_int());
       }
     }
   } else if (OB_UNLIKELY(0 != count)) {
