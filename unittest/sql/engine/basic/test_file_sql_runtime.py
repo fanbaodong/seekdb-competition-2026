@@ -7,6 +7,7 @@ directory and removes only that directory at the end.
 import argparse
 from pathlib import Path
 import tempfile
+import uuid
 import pymysql
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -62,10 +63,14 @@ with tempfile.TemporaryDirectory(prefix='seekdb_sql_', dir=parent) as tmp:
     assert query(f"select * from read_csv('{path('custom.csv')}',delimiter=';',quote='|',escape='|',nullstr='NA')") == ((1,'a;b',None),)
     query(f"copy (select 1 as id) to '{path('noheader.csv')}' (header false)")
     assert (root/'noheader.csv').read_text() == '1\n'
-    query('create temporary table copy_regression_source(id int, s varchar(30))')
-    query("insert into copy_regression_source values(1,'test')")
-    query(f"copy copy_regression_source to '{path('table.csv')}' (header)")
-    assert query(f"select * from read_csv('{path('table.csv')}')") == ((1,'test'),)
+    table_name = 'copy_regression_' + uuid.uuid4().hex
+    query(f'create table {table_name}(id int, s varchar(30))')
+    try:
+        query(f"insert into {table_name} values(1,'test')")
+        query(f"copy {table_name} to '{path('table.csv')}' (header)")
+        assert query(f"select * from read_csv('{path('table.csv')}')") == ((1,'test'),)
+    finally:
+        query(f'drop table {table_name}')
     # Two scalar-subquery rows force an execution error, after the sink opens.
     error(f"copy (select (select id from read_csv('{path('data.csv')}'))) to '{path('failed.csv')}'")
     assert not (root/'failed.csv').exists()

@@ -198,7 +198,7 @@ int ObSelectIntoOp::calc_outfile_path()
 }
 int ObSelectIntoOp::inner_get_next_row()
 {
-  int ret = 0 == top_limit_cnt_ ? OB_ITER_END : OB_SUCCESS;
+  int ret = 0 == top_limit_cnt_ && !is_file_copy() ? OB_ITER_END : OB_SUCCESS;
   int64_t row_count = 0;
   const ObItemType into_type = MY_SPEC.into_type_;
   ObPhysicalPlanCtx *phy_plan_ctx = NULL;
@@ -212,6 +212,9 @@ int ObSelectIntoOp::inner_get_next_row()
   }
   if (OB_SUCC(ret) && is_file_copy()) {
     OZ(write_header_if_needed(static_cast<ObCsvFileWriter *>(data_writer)));
+  }
+  if (OB_SUCC(ret) && 0 == top_limit_cnt_) {
+    ret = OB_ITER_END;
   }
   while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
     clear_evaluated_flag();
@@ -1034,6 +1037,8 @@ int ObSelectIntoOp::write_header_if_needed(ObCsvFileWriter *writer)
     }
     if (MY_SPEC.user_vars_.count() > 1) {
       OZ(write_obj_to_file(MY_SPEC.line_str_, *writer));
+      // Complete the header line so close flushes it even with no data rows.
+      OZ(check_csv_file_size(*writer));
       OZ(writer->flush_shared_buf(shared_buf_));
     }
   }
