@@ -1357,11 +1357,12 @@ int ObDASTRTaatIter::inner_load_next_hashmap()
       } else if (need_relevance) {
         ObDatum &relevance_datum = relevance_expr->locate_expr_datum(*ir_rtdef_->eval_ctx_);
         cur_relevance = relevance_datum.get_double();
-        if (OB_FAIL(map->get_refactored(doc_id, last_relevance))) {
-          if (OB_HASH_NOT_EXIST != ret) {
-          } else if (OB_FAIL(map->set_refactored(doc_id, cur_relevance, 1/*overwrite*/))) {
-          }
-        } else if (OB_FAIL(map->set_refactored(doc_id, cur_relevance + last_relevance, 1/*overwrite*/))) {
+        // The map already owns the doc-id key for repeated hits.
+        // Update the existing score in place instead of hashing twice.
+        double *existing_relevance = map->get(doc_id);
+        if (nullptr != existing_relevance) {
+          *existing_relevance += cur_relevance;
+        } else if (OB_FAIL(map->set_refactored(doc_id, cur_relevance))) {
         }
       } else {
         if (OB_FAIL(map->set_refactored(doc_id, 1, 0/*overwrite*/))) {
