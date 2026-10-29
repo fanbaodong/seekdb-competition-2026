@@ -943,6 +943,27 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   return ret;
 }
 
+int ObSelectIntoOp::write_header_if_needed(ObCsvFileWriter *writer)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(writer)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (!header_written_ && !MY_SPEC.user_vars_.empty()) {
+    header_written_ = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.user_vars_.count(); ++i) {
+      ObObj name;
+      name.set_varchar(MY_SPEC.user_vars_.at(i));
+      name.set_collation_type(MY_SPEC.cs_type_);
+      OZ(print_field(name, *writer));
+      if (OB_SUCC(ret) && i + 1 < MY_SPEC.user_vars_.count()) {
+        OZ(write_obj_to_file(MY_SPEC.field_str_, *writer));
+      }
+    }
+    OZ(write_obj_to_file(MY_SPEC.line_str_, *writer));
+  }
+  return ret;
+}
+
 int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
 {
   int ret = OB_SUCCESS;
@@ -952,6 +973,7 @@ int ObSelectIntoOp::into_outfile(ObExternalFileWriter *data_writer)
   ObCsvFileWriter *csv_data_writer = NULL;
   if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(write_header_if_needed(csv_data_writer))) {
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
     if (OB_ISNULL(select_exprs.at(i))) {
@@ -995,6 +1017,12 @@ int ObSelectIntoOp::into_outfile_batch_csv(const ObBatchRows &brs, ObExternalFil
   for (int64_t i = 0; OB_SUCC(ret) && i < select_exprs.count(); ++i) {
     if (OB_FAIL(select_exprs.at(i)->eval_batch(eval_ctx_, *brs.skip_, brs.size_))) {
     } else if (OB_FAIL(datum_vectors.push_back(select_exprs.at(i)->locate_expr_datumvector(eval_ctx_)))) {
+    }
+  }
+  if (OB_SUCC(ret) && !header_written_ && !MY_SPEC.user_vars_.empty()) {
+    if (OB_ISNULL(csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(write_header_if_needed(csv_data_writer))) {
     }
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < brs.size_; ++i) {
