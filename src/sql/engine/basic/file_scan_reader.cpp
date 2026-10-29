@@ -14,9 +14,6 @@
 #else
 #include <unistd.h>
 #endif
-#include <rapidjson/document.h>
-#include <rapidjson/error/en.h>
-#include <rapidjson/memorystream.h>
 
 namespace oceanbase { namespace sql {
 namespace {
@@ -27,10 +24,237 @@ std::string lower_ascii(std::string value)
 }
 bool valid_utf8(const std::string &value)
 {
-  rapidjson::MemoryStream stream(value.data(), value.size());
-  while (stream.Tell() < value.size()) {
-    unsigned codepoint = 0;
-    if (!rapidjson::UTF8<>::Decode(stream, &codepoint) || codepoint == 0) return false;
+  size_t i = 0;
+  while (i < value.size()) {
+    const unsigned char c = static_cast<unsigned char>(value[i]);
+    if (c == 0) return false;
+    if (c < 0x80) { ++i; continue; }
+    size_t extra = 0;
+    unsigned cp = 0;
+    if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1Fu; }
+    else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0Fu; }
+    else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07u; }
+    else return false;
+    for (size_t k = 1; k <= extra; ++k) {
+      if (i + k >= value.size()) return false;
+      const unsigned char cc = static_cast<unsigned char>(value[i + k]);
+      if ((cc & 0xC0) != 0x80) return false;
+      cp = (cp << 6) | (cc & 0x3Fu);
+    }
+    if ((1 == extra && cp < 0x80) || (2 == extra && cp < 0x800)
+        || (3 == extra && cp < 0x10000) || cp > 0x10FFFF
+        || (cp >= 0xD800 && cp <= 0xDFFF) || 0 == cp) return false;
+    i += extra + 1;
+  }
+  return true;
+}
+
+void json_skip_ws(const std::string &text, size_t &pos)
+{
+  while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t'
+                               || text[pos] == '\n' || text[pos] == '\r')) ++pos;
+}
+
+void append_utf8(unsigned cp, std::string &out)
+{
+  if (cp < 0x80) {
+    out.push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else if (cp < 0x10000) {
+    out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+}
+
+bool json_parse_string(const std::string &text, size_t &pos, std::string &out)
+{
+  if (pos >= text.size() || text[pos] != '"') return false;
+  ++pos;
+  out.clear();
+  while (pos < text.size()) {
+    const unsigned char c = static_cast<unsigned char>(text[pos++]);
+    if (c == '"') return true;
+    if (c == '\\') {
+      if (pos >= text.size()) return false;
+      const char esc = text[pos++];
+      switch (esc) {
+        case '"': out.push_back('"'); break;
+        case '\\': out.push_back('\\'); break;
+        case '/': out.push_back('/'); break;
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'r': out.push_back('\r'); break;
+        case 't': out.push_back('\t'); break;
+        case 'u': {
+          unsigned code = 0;
+          for (int i = 0; i < 4; ++i) {
+            if (pos >= text.size()) return false;
+            const char h = text[pos++];
+            code <<= 4;
+            if (h >= '0' && h <= '9') code |= static_cast<unsigned>(h - '0');
+            else if (h >= 'a' && h <= 'f') code |= static_cast<unsigned>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') code |= static_cast<unsigned>(h - 'A' + 10);
+            else return false;
+          }
+          if (code >= 0xD800 && code <= 0xDBFF) {
+            if (pos + 6 > text.size() || text[pos] != '\\' || text[pos + 1] != 'u') return false;
+            pos += 2;
+            unsigned low = 0;
+            for (int i = 0; i < 4; ++i) {
+              const char h = text[pos++];
+              low <<= 4;
+              if (h >= '0' && h <= '9') low |= static_cast<unsigned>(h - '0');
+              else if (h >= 'a' && h <= 'f') low |= static_cast<unsigned>(h - 'a' + 10);
+              else if (h >= 'A' && h <= 'F') low |= static_cast<unsigned>(h - 'A' + 10);
+              else return false;
+            }
+            if (low < 0xDC00 || low > 0xDFFF) return false;
+            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+          } else if (code >= 0xDC00 && code <= 0xDFFF) {
+            return false;
+          }
+          if (0 == code) return false;
+          append_utf8(code, out);
+          break;
+        }
+        default:
+          return false;
+      }
+    } else if (c < 0x20) {
+      return false;
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+  return false;
+}
+
+bool json_parse_number(const std::string &text, size_t &pos, FileCell &cell)
+{
+  const size_t start = pos;
+  if (pos < text.size() && text[pos] == '-') ++pos;
+  const size_t int_start = pos;
+  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') ++pos;
+  if (pos == int_start) return false;
+  bool is_double = false;
+  if (pos < text.size() && text[pos] == '.') {
+    is_double = true;
+    ++pos;
+    const size_t frac = pos;
+    while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') ++pos;
+    if (pos == frac) return false;
+  }
+  if (pos < text.size() && (text[pos] == 'e' || text[pos] == 'E')) {
+    is_double = true;
+    ++pos;
+    if (pos < text.size() && (text[pos] == '+' || text[pos] == '-')) ++pos;
+    const size_t exp = pos;
+    while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') ++pos;
+    if (pos == exp) return false;
+  }
+  const std::string number = text.substr(start, pos - start);
+  cell.is_null = false;
+  if (!is_double) {
+    int64_t value = 0;
+    const char *begin = number.data();
+    const char *end = begin + number.size();
+    const auto parsed = std::from_chars(begin, end, value);
+    if (parsed.ec == std::errc() && parsed.ptr == end) {
+      cell.text = std::to_string(value);
+      return true;
+    }
+  }
+  char *stop = nullptr;
+  errno = 0;
+  const double value = strtod(number.c_str(), &stop);
+  if (stop != number.c_str() + number.size() || !std::isfinite(value)) return false;
+  char buf[64] = {0};
+  snprintf(buf, sizeof(buf), "%.17g", value);
+  cell.text = buf;
+  return true;
+}
+
+bool json_parse_value(const std::string &text, size_t &pos, FileCell &cell)
+{
+  json_skip_ws(text, pos);
+  if (pos >= text.size()) return false;
+  const char c = text[pos];
+  if (c == '"') {
+    cell.is_null = false;
+    return json_parse_string(text, pos, cell.text);
+  }
+  if (c == 't' && text.compare(pos, 4, "true") == 0) {
+    pos += 4; cell.is_null = false; cell.text = "true"; return true;
+  }
+  if (c == 'f' && text.compare(pos, 5, "false") == 0) {
+    pos += 5; cell.is_null = false; cell.text = "false"; return true;
+  }
+  if (c == 'n' && text.compare(pos, 4, "null") == 0) {
+    pos += 4; cell.is_null = true; cell.text.clear(); return true;
+  }
+  if (c == '{' || c == '[') return false;
+  return json_parse_number(text, pos, cell);
+}
+
+bool json_parse_object(const std::string &text,
+                       std::vector<std::pair<std::string, FileCell>> &fields,
+                       std::string &error)
+{
+  fields.clear();
+  size_t pos = 0;
+  json_skip_ws(text, pos);
+  if (pos >= text.size() || text[pos] != '{') {
+    error = "JSONL rows must be flat objects";
+    return false;
+  }
+  ++pos;
+  json_skip_ws(text, pos);
+  if (pos < text.size() && text[pos] == '}') {
+    ++pos;
+  } else {
+    while (true) {
+      json_skip_ws(text, pos);
+      std::string name;
+      if (!json_parse_string(text, pos, name)) {
+        error = "invalid JSONL field name";
+        return false;
+      }
+      json_skip_ws(text, pos);
+      if (pos >= text.size() || text[pos] != ':') {
+        error = "invalid JSONL object";
+        return false;
+      }
+      ++pos;
+      FileCell cell;
+      if (!json_parse_value(text, pos, cell)) {
+        error = "nested JSON objects and arrays are unsupported";
+        return false;
+      }
+      fields.emplace_back(std::move(name), std::move(cell));
+      if (fields.size() > FileScanReader::MAX_COLUMNS) {
+        error = "too many JSONL fields";
+        return false;
+      }
+      json_skip_ws(text, pos);
+      if (pos < text.size() && text[pos] == ',') { ++pos; continue; }
+      if (pos < text.size() && text[pos] == '}') { ++pos; break; }
+      error = "invalid JSONL object";
+      return false;
+    }
+  }
+  json_skip_ws(text, pos);
+  if (pos != text.size()) {
+    error = "trailing data after JSONL object";
+    return false;
   }
   return true;
 }
@@ -338,26 +562,22 @@ bool FileScanReader::json_record(std::vector<std::string> &names, std::vector<Fi
     text.push_back(static_cast<char>(c));
     if (text.size() > MAX_RECORD_BYTES) return fail("JSONL record exceeds 16 MiB");
   }
-  rapidjson::Document doc;
-  doc.Parse<rapidjson::kParseValidateEncodingFlag>(text.data(), text.size());
-  if (doc.HasParseError()) return fail(std::string("invalid JSONL: ") + rapidjson::GetParseError_En(doc.GetParseError()));
-  if (!doc.IsObject()) return fail("JSONL rows must be flat objects");
-  if (doc.MemberCount() > MAX_COLUMNS) return fail("too many JSONL fields");
+  std::vector<std::pair<std::string, FileCell>> fields;
+  std::string error;
+  if (!json_parse_object(text, fields, error)) return fail(error);
+  if (fields.size() > MAX_COLUMNS) return fail("too many JSONL fields");
   std::set<std::string> seen;
-  for (auto it = doc.MemberBegin(); it != doc.MemberEnd(); ++it) {
-    const std::string name(it->name.GetString(), it->name.GetStringLength());
-    if (name.empty() || !valid_utf8(name) || !seen.insert(lower_ascii(name)).second) return fail("empty or duplicate JSONL field name");
-    const auto &v = it->value;
-    FileCell cell;
-    cell.is_null = v.IsNull();
-    if (v.IsString()) cell.text.assign(v.GetString(), v.GetStringLength());
-    else if (v.IsBool()) cell.text = v.GetBool() ? "true" : "false";
-    else if (v.IsInt64()) cell.text = std::to_string(v.GetInt64());
-    else if (v.IsUint64()) cell.text = std::to_string(v.GetUint64());
-    else if (v.IsDouble()) { char buf[64]; snprintf(buf, sizeof(buf), "%.17g", v.GetDouble()); cell.text = buf; }
-    else if (!v.IsNull()) return fail("nested JSON objects and arrays are unsupported");
-    if (cell.text.size() > MAX_FIELD_BYTES || !valid_utf8(cell.text)) return fail("invalid or oversized JSONL field");
-    names.push_back(name); row.push_back(std::move(cell));
+  for (auto &field : fields) {
+    const std::string &name = field.first;
+    if (name.empty() || !valid_utf8(name) || !seen.insert(lower_ascii(name)).second) {
+      return fail("empty or duplicate JSONL field name");
+    }
+    FileCell &cell = field.second;
+    if (cell.text.size() > MAX_FIELD_BYTES || !valid_utf8(cell.text)) {
+      return fail("invalid or oversized JSONL field");
+    }
+    names.push_back(name);
+    row.push_back(std::move(cell));
   }
   return true;
 }
