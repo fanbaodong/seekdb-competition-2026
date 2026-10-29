@@ -57,7 +57,10 @@ private:
   mutable bool hash_valid_;
 };
 
-typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+// TOKENIZE, fulltext row generation and query tokenization construct this map
+// on their stack and consume it synchronously. Shared dictionaries use separate
+// containers; taking a latch for every document-local token is unnecessary.
+typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
 
 class ObAddWordFlag final
 {
