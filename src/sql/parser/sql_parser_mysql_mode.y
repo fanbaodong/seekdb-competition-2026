@@ -500,7 +500,7 @@ END_P SET_VAR DELIMITER
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
-%type <node> file_table_expr file_table_name file_table_options file_table_option_list file_table_option file_table_alias
+%type <node> file_table_expr file_table_name file_table_option_list file_table_option file_table_alias
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -16702,11 +16702,6 @@ file_table_name '(' literal ')' file_table_alias
   merge_nodes(options, result, T_EXPR_LIST, $5);
   malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 4, $1, $3, options, $7);
 }
-;
-
-file_table_options:
-/* empty */ { $$ = NULL; }
-| ',' file_table_option_list { merge_nodes($$, result, T_EXPR_LIST, $2); }
 ;
 
 file_table_option_list:
