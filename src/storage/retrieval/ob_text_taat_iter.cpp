@@ -71,8 +71,6 @@ int ObTextTaaTIter::pre_process()
     } else {
       const int64_t total_doc_cnt = bm25_param_estimator_.get_total_doc_cnt();
       partition_cnt_ = MIN((total_doc_cnt-1) / OB_HASHMAP_DEFAULT_SIZE + 1, OB_MAX_HASHMAP_COUNT);
-      // Bounded in-memory TaaT avoids a redundant spill-store pass.
-      direct_map_mode_ = total_doc_cnt > 0 && total_doc_cnt <= 32768 && !function_lookup_mode_;
     }
   }
   return ret;

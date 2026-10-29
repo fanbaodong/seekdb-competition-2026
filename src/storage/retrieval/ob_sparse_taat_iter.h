@@ -45,7 +45,6 @@ protected:
   virtual int pre_process(); // should set partition_cnt_, among other things
   virtual int init_chunk_stores();
   virtual int fill_chunk_stores();
-  int fill_hash_maps_directly();
   virtual int load_next_hash_map();
   virtual int project_results(const int64_t safe_capacity, int64_t &count);
   virtual int update_dim_iter(const int64_t dim_idx); // should return OB_ITER_END if no more dimensions
@@ -57,7 +56,6 @@ protected:
   ObSparseRetrievalMergeParam *iter_param_;
   ObISparseRetrievalDimIter *dim_iter_;
   int64_t partition_cnt_;
-  bool direct_map_mode_;
   query::ObSpillRowStore **datum_stores_;
   query::ObSpillRowStoreIterator **datum_store_iters_;
   sql::ObBitVector **skips_;
