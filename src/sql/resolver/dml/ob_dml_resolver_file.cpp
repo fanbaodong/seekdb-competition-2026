@@ -32,7 +32,7 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
   } else if (OB_FAIL(resolve_str_const(*node.children_[1], path))) {
   } else {
     format.assign(node.children_[0]->str_value_, node.children_[0]->str_len_);
-    if (format != "csv" && format != "jsonl" && format != "glob") {
+    if (format != "csv" && format != "jsonl" && format != "glob" && format != "parquet") {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file scan format");
     }

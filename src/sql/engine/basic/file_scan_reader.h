@@ -69,6 +69,7 @@ private:
   bool skip_header();
   bool fingerprint(std::string &value);
   bool expand_glob();
+  bool parquet_signature(std::string &value);
   FILE *file_ = nullptr;
   std::string path_;
   std::string format_;
@@ -76,6 +77,8 @@ private:
   std::string signature_;
   FileReadOptions options_;
   std::vector<FileColumn> columns_;
+  std::vector<std::vector<FileCell>> parquet_rows_;
+  size_t parquet_index_ = 0;
   std::vector<std::string> glob_matches_;
   size_t glob_index_ = 0;
   int64_t line_ = 1;

@@ -1,11 +1,13 @@
 /* Copyright (c) 2025 OceanBase. Licensed under the Apache License, Version 2.0. */
 #include "sql/engine/basic/file_scan_reader.h"
+#include "sql/engine/basic/file_parquet.h"
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
 #include <sys/stat.h>
@@ -219,7 +221,9 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
   line_ = 1;
   glob_matches_.clear();
   glob_index_ = 0;
-  if (format != "csv" && format != "jsonl" && format != "glob") return fail("unsupported file format");
+  if (format != "csv" && format != "jsonl" && format != "glob" && format != "parquet") {
+    return fail("unsupported file format");
+  }
   if (format == "glob") {
     if (!expand_glob()) return false;
     columns_.clear();
@@ -227,6 +231,16 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
     row_count_ = static_cast<int64_t>(glob_matches_.size());
     glob_index_ = 0;
     return true;
+  }
+  if (format == "parquet") {
+    std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
+    if (!input) return fail("cannot open file");
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (!input.good() && !input.eof()) return fail("cannot read file");
+    if (!decode_parquet(bytes, columns_, parquet_rows_, error_)) return false;
+    row_count_ = static_cast<int64_t>(parquet_rows_.size());
+    parquet_index_ = 0;
+    return parquet_signature(signature_);
   }
   if (!options.delimiter || !options.quote || options.delimiter == options.quote
       || options.delimiter == '\n' || options.delimiter == '\r'
@@ -246,11 +260,29 @@ void FileScanReader::close()
   if (file_) { fclose(file_); file_ = nullptr; }
   glob_matches_.clear();
   glob_index_ = 0;
+  parquet_rows_.clear();
+  parquet_index_ = 0;
+}
+
+bool FileScanReader::parquet_signature(std::string &value)
+{
+  std::error_code ec;
+  const auto path = std::filesystem::u8path(path_);
+  const auto size = std::filesystem::file_size(path, ec);
+  if (ec) return fail("file disappeared while scanning");
+  const auto modified = std::filesystem::last_write_time(path, ec);
+  if (ec) return fail("file disappeared while scanning");
+  value = std::to_string(size) + ":" + std::to_string(modified.time_since_epoch().count());
+  return true;
 }
 
 bool FileScanReader::check_unchanged()
 {
   if (format_ == "glob") return true;
+  if (format_ == "parquet") {
+    std::string current;
+    return parquet_signature(current) && (current == signature_ || fail("file changed while scanning"));
+  }
   std::string current;
   return file_ && fingerprint(current) && (current == signature_ || fail("file changed while scanning"));
 }
@@ -389,6 +421,10 @@ bool FileScanReader::rewind()
     glob_index_ = 0;
     return true;
   }
+  if (format_ == "parquet") {
+    parquet_index_ = 0;
+    return check_unchanged();
+  }
   if (!check_unchanged() || fseek(file_, 0, SEEK_SET) != 0) return fail("cannot rewind unchanged file");
   clearerr(file_); line_ = 1;
   return skip_header();
@@ -433,6 +469,10 @@ FileColumnType FileScanReader::widen(FileColumnType left, FileColumnType right)
 
 bool FileScanReader::infer()
 {
+  if (format_ == "parquet") {
+    row_count_ = static_cast<int64_t>(parquet_rows_.size());
+    return columns_.empty() ? fail("parquet schema is empty") : rewind();
+  }
   columns_.clear(); row_count_ = 0;
   if (format_ == "glob") {
     if (!expand_glob()) return false;
@@ -498,6 +538,13 @@ bool FileScanReader::next(std::vector<FileCell> &row, bool &eof)
     cell.text = glob_matches_[glob_index_++];
     cell.is_null = false;
     row.assign(1, std::move(cell));
+    return true;
+  }
+  if (format_ == "parquet") {
+    if (!check_unchanged()) return false;
+    eof = parquet_index_ >= parquet_rows_.size();
+    if (eof) return true;
+    row = parquet_rows_[parquet_index_++];
     return true;
   }
   if (!check_unchanged()) return false;
