@@ -193,6 +193,8 @@ SQL_INTERFACE_CLOSURE_HEADERS = [
     "engine/basic/chunk_store/ob_chunk_block.h",
     "engine/basic/chunk_store/ob_chunk_block_compressor.h",
     "engine/basic/chunk_store/ob_compact_store.h",
+    "engine/basic/file_parquet.h",
+    "engine/basic/file_scan_reader.h",
     "engine/basic/ob_batch_result_holder.h",
     "engine/basic/ob_chunk_datum_store.h",
     "engine/basic/ob_chunk_row_store.h",
