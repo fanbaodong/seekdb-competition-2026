@@ -51,7 +51,7 @@
     malloc_terminal_node(display_node, result->malloc_pool_, display_type); \
   } \
   malloc_non_terminal_node(explain_stmt, result->malloc_pool_, T_EXPLAIN, 5, \
-                           type_node, display_node, into_table, set_statement_id, stmt);
+                           type_node ? type_node : no_use, display_node, into_table, set_statement_id, stmt);
 %}
 
 %destructor {destroy_tree($$);}<node>
@@ -12314,8 +12314,8 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE {malloc_terminal_node($$, result->malloc_pool_, T_TRADITIONAL); $$->value_ = 1;}
+| DESC {malloc_terminal_node($$, result->malloc_pool_, T_TRADITIONAL); $$->value_ = 1;}
 ;
 
 explainable_stmt:
@@ -16652,6 +16652,19 @@ COPY '(' select_stmt ')' TO STRING_VALUE opt_copy_options
   $6->is_forbid_parameter_ = true;
   malloc_non_terminal_node($$, result->malloc_pool_, T_COPY, 3, $3, $6, $7);
 }
+| COPY tbl_name TO STRING_VALUE opt_copy_options
+{
+  ParseNode *star = NULL, *projection = NULL, *projects = NULL, *tables = NULL, *query = NULL;
+  malloc_terminal_node(star, result->malloc_pool_, T_STAR);
+  malloc_non_terminal_node(projection, result->malloc_pool_, T_PROJECT_STRING, 1, star);
+  malloc_non_terminal_node(projects, result->malloc_pool_, T_PROJECT_LIST, 1, projection);
+  malloc_non_terminal_node(tables, result->malloc_pool_, T_FROM_LIST, 1, $2);
+  malloc_select_node(query, result->malloc_pool_);
+  query->children_[PARSE_SELECT_SELECT] = projects;
+  query->children_[PARSE_SELECT_FROM] = tables;
+  $4->is_forbid_parameter_ = true;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY, 3, query, $4, $5);
+}
 ;
 
 opt_copy_options:
@@ -16671,7 +16684,9 @@ relation_name
 | relation_name relation_name
 { malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
 | relation_name STRING_VALUE
-{ malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
+{ $2->is_forbid_parameter_ = true; malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
+| relation_name BOOL_VALUE
+{ $2->is_forbid_parameter_ = true; malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
 ;
 
 file_table_expr:

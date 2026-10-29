@@ -232,16 +232,6 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
     glob_index_ = 0;
     return true;
   }
-  if (format == "parquet") {
-    std::ifstream input(std::filesystem::u8path(path), std::ios::binary);
-    if (!input) return fail("cannot open file");
-    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    if (!input.good() && !input.eof()) return fail("cannot read file");
-    if (!decode_parquet(bytes, columns_, parquet_rows_, error_)) return false;
-    row_count_ = static_cast<int64_t>(parquet_rows_.size());
-    parquet_index_ = 0;
-    return parquet_signature(signature_);
-  }
   if (!options.delimiter || !options.quote || options.delimiter == options.quote
       || options.delimiter == '\n' || options.delimiter == '\r'
       || options.quote == '\n' || options.quote == '\r') return fail("invalid CSV delimiter or quote");
@@ -252,6 +242,11 @@ bool FileScanReader::open(const std::string &path, const std::string &format, co
 #endif
   if (!file_) return fail("cannot open file");
   if (!fingerprint(signature_)) { close(); return false; }
+  if (format == "parquet") {
+    parquet_ = new ParquetReader();
+    if (!parquet_->open(file_, columns_, error_) || !check_unchanged()) { close(); return false; }
+    row_count_ = parquet_->row_count();
+  }
   return true;
 }
 
@@ -260,29 +255,13 @@ void FileScanReader::close()
   if (file_) { fclose(file_); file_ = nullptr; }
   glob_matches_.clear();
   glob_index_ = 0;
-  parquet_rows_.clear();
-  parquet_index_ = 0;
-}
-
-bool FileScanReader::parquet_signature(std::string &value)
-{
-  std::error_code ec;
-  const auto path = std::filesystem::u8path(path_);
-  const auto size = std::filesystem::file_size(path, ec);
-  if (ec) return fail("file disappeared while scanning");
-  const auto modified = std::filesystem::last_write_time(path, ec);
-  if (ec) return fail("file disappeared while scanning");
-  value = std::to_string(size) + ":" + std::to_string(modified.time_since_epoch().count());
-  return true;
+  delete parquet_;
+  parquet_ = nullptr;
 }
 
 bool FileScanReader::check_unchanged()
 {
   if (format_ == "glob") return true;
-  if (format_ == "parquet") {
-    std::string current;
-    return parquet_signature(current) && (current == signature_ || fail("file changed while scanning"));
-  }
   std::string current;
   return file_ && fingerprint(current) && (current == signature_ || fail("file changed while scanning"));
 }
@@ -422,8 +401,7 @@ bool FileScanReader::rewind()
     return true;
   }
   if (format_ == "parquet") {
-    parquet_index_ = 0;
-    return check_unchanged();
+    return check_unchanged() && parquet_ && parquet_->rewind(error_);
   }
   if (!check_unchanged() || fseek(file_, 0, SEEK_SET) != 0) return fail("cannot rewind unchanged file");
   clearerr(file_); line_ = 1;
@@ -470,8 +448,16 @@ FileColumnType FileScanReader::widen(FileColumnType left, FileColumnType right)
 bool FileScanReader::infer()
 {
   if (format_ == "parquet") {
-    row_count_ = static_cast<int64_t>(parquet_rows_.size());
-    return columns_.empty() ? fail("parquet schema is empty") : rewind();
+    if (!rewind()) return false;
+    for (auto &column : columns_) column.non_null_count = 0;
+    std::vector<FileCell> row;
+    bool eof = false;
+    while (true) {
+      if (!next(row, eof)) return false;
+      if (eof) break;
+      for (size_t i = 0; i < row.size(); ++i) if (!row[i].is_null) ++columns_[i].non_null_count;
+    }
+    return rewind();
   }
   columns_.clear(); row_count_ = 0;
   if (format_ == "glob") {
@@ -541,11 +527,7 @@ bool FileScanReader::next(std::vector<FileCell> &row, bool &eof)
     return true;
   }
   if (format_ == "parquet") {
-    if (!check_unchanged()) return false;
-    eof = parquet_index_ >= parquet_rows_.size();
-    if (eof) return true;
-    row = parquet_rows_[parquet_index_++];
-    return true;
+    return check_unchanged() && parquet_ && parquet_->next(row, eof, error_);
   }
   if (!check_unchanged()) return false;
   std::vector<std::string> names;

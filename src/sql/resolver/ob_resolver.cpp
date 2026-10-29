@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include <set>
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -247,6 +248,15 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
           ret = OB_ERR_UNEXPECTED;
         } else {
           bool has_header = false;
+          ObString null_text, delimiter = ObString::make_string(",");
+          ObString quote = ObString::make_string("\""), escape = quote;
+          std::set<std::string> seen;
+          ObObj enabled;
+          if (OB_FAIL(params_.session_info_->get_sys_variable(SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+          } else if (!enabled.get_bool()) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL is disabled; SET SESSION enable_file_sql=ON first");
+          }
           select_stmt = static_cast<ObSelectStmt *>(stmt);
           for (int64_t i = 0; OB_SUCC(ret) && option_list && i < option_list->num_child_; ++i) {
             const ParseNode *option = option_list->children_[i];
@@ -255,8 +265,18 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
             } else {
               std::string key(option->children_[0]->str_value_, option->children_[0]->str_len_);
               for (char &c : key) if ('A' <= c && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-              if ("header" == key) {
-                has_header = true;
+              const ParseNode *value = option->num_child_ > 1 ? option->children_[1] : nullptr;
+              if (!seen.insert(key).second) {
+                ret = OB_INVALID_ARGUMENT;
+              } else if ("header" == key) {
+                if (!value) has_header = true;
+                else if (value->type_ == T_BOOL || value->type_ == T_INT) has_header = value->value_ != 0;
+                else {
+                  const ObString v(value->str_len_, value->str_value_);
+                  if (v.case_compare("true") == 0) has_header = true;
+                  else if (v.case_compare("false") == 0) has_header = false;
+                  else ret = OB_INVALID_ARGUMENT;
+                }
               } else if ("format" == key) {
                 const ParseNode *value = option->num_child_ > 1 ? option->children_[1] : NULL;
                 std::string format(value && value->str_value_ ? value->str_value_ : "",
@@ -266,14 +286,30 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
                   ret = OB_NOT_SUPPORTED;
                   LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY format other than csv");
                 }
-              } else if ("nullstr" == key) {
-                // Accepted for DuckDB compatibility; the CSV writer prints NULL as text.
+              } else if ("nullstr" == key || "delimiter" == key || "delim" == key
+                         || "quote" == key || "escape" == key) {
+                if (!value || value->type_ != T_VARCHAR) {
+                  ret = OB_INVALID_ARGUMENT;
+                } else {
+                  ObString copied;
+                  if (OB_FAIL(ob_write_string(*params_.allocator_,
+                      ObString(value->str_len_, value->str_value_), copied))) {
+                  } else if (key == "nullstr") null_text = copied;
+                  else if (copied.length() != 1 || copied.ptr()[0] == 0
+                           || copied.ptr()[0] == '\r' || copied.ptr()[0] == '\n') ret = OB_INVALID_ARGUMENT;
+                  else if (key == "quote") quote = copied;
+                  else if (key == "escape") escape = copied;
+                  else delimiter = copied;
+                }
               } else {
                 ret = OB_NOT_SUPPORTED;
                 LOG_USER_ERROR(OB_NOT_SUPPORTED, "this COPY option");
               }
             }
           }
+          if (!seen.count("escape")) escape = quote;
+          if (OB_SUCC(ret) && delimiter == quote) ret = OB_INVALID_ARGUMENT;
+          if (OB_SUCC(ret) && select_stmt->get_select_into()) ret = OB_INVALID_ARGUMENT;
           if (OB_SUCC(ret)) {
             ObSelectIntoItem *into = static_cast<ObSelectIntoItem *>(
                 params_.allocator_->alloc(sizeof(ObSelectIntoItem)));
@@ -286,19 +322,25 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
                                           ObString(path_node->str_len_, path_node->str_value_),
                                           path_copy))) {
               } else {
-                static const char *FIELD_TERM = ",";
                 static const char *LINE_TERM = "\n";
-                static const char QUOTE = '"';
                 into->into_type_ = T_INTO_OUTFILE;
                 into->outfile_name_.set_varchar(path_copy);
                 into->outfile_name_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
-                into->field_str_.set_varchar(ObString::make_string(FIELD_TERM));
+                into->field_str_.set_varchar(delimiter);
                 into->field_str_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
                 into->line_str_.set_varchar(ObString::make_string(LINE_TERM));
                 into->line_str_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
-                into->closed_cht_.set_char_value(&QUOTE, 1);
+                into->closed_cht_.set_char_value(quote.ptr(), 1);
+                into->escaped_cht_.set_char_value(escape.ptr(), 1);
                 into->closed_cht_.set_collation_type(CS_TYPE_UTF8MB4_BIN);
                 into->is_optional_ = true;
+                into->cs_type_ = CS_TYPE_UTF8MB4_BIN;
+                // OUTFILE normally has no user_vars. For COPY, slot 0 carries
+                // the NULL text; remaining entries are optional header names.
+                ret = into->user_vars_.push_back(null_text);
+                ObGlobalHint &hint = const_cast<ObGlobalHint &>(select_stmt->get_query_ctx()->get_query_hint_for_update().get_global_hint());
+                hint.plan_cache_policy_ = OB_USE_PLAN_CACHE_NONE;
+                hint.parallel_ = 1;
                 for (int64_t i = 0; OB_SUCC(ret) && has_header
                      && i < select_stmt->get_select_item_size(); ++i) {
                   ObString name = select_stmt->get_select_item(i).alias_name_;
