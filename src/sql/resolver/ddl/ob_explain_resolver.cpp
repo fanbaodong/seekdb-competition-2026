@@ -48,89 +48,34 @@ const ParseNode *find_file_table(const ParseNode *node)
 int ObExplainResolver::resolve_file_describe(const ParseNode &select_node)
 {
   int ret = OB_SUCCESS;
-  const ParseNode *table_node = find_file_table(&select_node);
-  ObObj enabled;
-  ObString path, secure_path;
-  FileReadOptions options;
-  FileScanReader reader;
-  std::string canonical, error, format;
   ObSelectStmt *stmt = nullptr;
   TableItem *item = nullptr;
   ObValuesTableDef *def = nullptr;
-  if (OB_ISNULL(table_node) || table_node->num_child_ != 4
-      || OB_ISNULL(table_node->children_[0]) || OB_ISNULL(table_node->children_[1])) {
+  ObStmt *resolved = nullptr;
+  ObResolver resolver(params_);
+  struct MetaColumn { std::string name; std::string type; bool not_null; };
+  std::vector<MetaColumn> columns;
+  // Resolve the entire projection: aliases, joins, invalid column references
+  // and all file options must obey exactly the same rules as an ordinary SELECT.
+  if (OB_FAIL(resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT, select_node, resolved))) {
+  } else if (!resolved || !resolved->is_select_stmt()) {
     ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(session_info_) || OB_ISNULL(allocator_) || OB_ISNULL(params_.expr_factory_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
-  } else if (!enabled.get_bool()) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL is disabled; SET SESSION enable_file_sql=ON first");
-  } else if (OB_FAIL(resolve_str_const(*table_node->children_[1], path))) {
   } else {
-    format.assign(table_node->children_[0]->str_value_, table_node->children_[0]->str_len_);
-    if (format != "csv" && format != "jsonl" && format != "glob") {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file scan format");
-    }
-  }
-  std::set<std::string> seen_options;
-  const ParseNode *option_list = table_node ? table_node->children_[2] : nullptr;
-  for (int64_t i = 0; OB_SUCC(ret) && option_list && i < option_list->num_child_; ++i) {
-    const ParseNode *option = option_list->children_[i];
-    if (!option || option->num_child_ != 2 || !option->children_[0] || !option->children_[1]) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      const ParseNode *value = option->children_[1];
-      std::string key(option->children_[0]->str_value_, option->children_[0]->str_len_);
-      for (char &c : key) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-      if (!seen_options.insert(key).second) {
-        ret = OB_INVALID_ARGUMENT;
-      } else if (key == "sample_size") {
-        if (!(value->type_ == T_OP_NEG && value->num_child_ == 1 && value->children_[0]
-              && (value->children_[0]->type_ == T_INT || value->children_[0]->type_ == T_QUESTIONMARK))) {
-          ret = OB_NOT_SUPPORTED;
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL sample_size other than -1");
-        }
-      } else if (key == "header" && format == "csv") {
-        if ((value->type_ != T_BOOL && value->type_ != T_INT) || value->value_ < 0 || value->value_ > 1) {
-          ret = OB_INVALID_ARGUMENT;
-        } else {
-          options.header = value->value_ != 0;
-        }
-      } else if (value->type_ == T_VARCHAR || value->type_ == T_QUESTIONMARK) {
-        ObString str;
-        if (OB_FAIL(resolve_str_const(*value, str))) {
-        } else if (key == "format" && format == "jsonl" && str.case_compare("newline_delimited") == 0) {
-        } else if (key == "nullstr" && format == "csv") {
-          options.null_string.assign(str.ptr(), str.length());
-        } else if ((key == "delim" || key == "delimiter" || key == "quote" || key == "escape")
-                   && format == "csv" && str.length() == 1) {
-          if (key == "quote") options.quote = str.ptr()[0];
-          else if (key == "escape") options.escape = str.ptr()[0];
-          else options.delimiter = str.ptr()[0];
-        } else {
-          ret = OB_NOT_SUPPORTED;
-        }
-      } else {
-        ret = OB_NOT_SUPPORTED;
+    const ObSelectStmt &query = *static_cast<ObSelectStmt *>(resolved);
+    for (int64_t i = 0; i < query.get_select_item_size(); ++i) {
+      const SelectItem &selected = query.get_select_item(i);
+      const ObString name = selected.alias_name_.empty() ? selected.expr_name_ : selected.alias_name_;
+      const char *type = "VARCHAR";
+      switch (selected.expr_->get_result_type().get_type()) {
+        case ObIntType: type = "BIGINT"; break;
+        case ObDoubleType: type = "DOUBLE"; break;
+        case ObTinyIntType: type = "BOOLEAN"; break;
+        case ObDateType: type = "DATE"; break;
+        case ObDateTimeType: type = "DATETIME"; break;
+        default: break;
       }
-    }
-  }
-  if (OB_SUCC(ret)) {
-    const std::string raw_path(path.ptr() ? path.ptr() : "", path.length());
-    const bool resolved = format == "glob"
-        ? FileScanReader::canonical_glob(raw_path, canonical, error)
-        : FileScanReader::canonical_path(raw_path, canonical, error);
-    if (!resolved) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, error.c_str());
-    } else if (OB_FAIL(session_info_->get_secure_file_priv(secure_path))) {
-    } else if (OB_FAIL(ObResolverUtils::check_secure_path(
-        secure_path, ObString(static_cast<int32_t>(canonical.size()), canonical.data())))) {
-    } else if (!reader.open(canonical, format, options) || !reader.infer()) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, reader.error().c_str());
+      columns.push_back({std::string(name.ptr(), name.length()), type,
+          (selected.expr_->get_result_flag() & NOT_NULL_FLAG) != 0});
     }
   }
   if (OB_SUCC(ret)) {
@@ -149,7 +94,7 @@ int ObExplainResolver::resolve_file_describe(const ParseNode &select_node)
     }
   }
   if (OB_SUCC(ret)) {
-    const int64_t column_count = static_cast<int64_t>(reader.columns().size());
+    const int64_t column_count = static_cast<int64_t>(columns.size());
     static const char *META_NAMES[] = {"column_name", "column_type", "null", "key", "default", "extra"};
     const int64_t meta_columns = 6;
     item->table_id_ = generate_table_id();
@@ -176,18 +121,8 @@ int ObExplainResolver::resolve_file_describe(const ParseNode &select_node)
       }
     }
     for (int64_t row = 0; OB_SUCC(ret) && row < column_count; ++row) {
-      const FileColumn &column = reader.columns()[row];
-      const char *type_name = "VARCHAR";
-      switch (column.type) {
-        case FileColumnType::BIGINT: type_name = "BIGINT"; break;
-        case FileColumnType::DOUBLE: type_name = "DOUBLE"; break;
-        case FileColumnType::BOOLEAN: type_name = "BOOLEAN"; break;
-        case FileColumnType::DATE: type_name = "DATE"; break;
-        case FileColumnType::DATETIME: type_name = "DATETIME"; break;
-        default: break;
-      }
-      const bool non_null = reader.row_count() > 0 && column.non_null_count == reader.row_count();
-      const std::string cells[] = {column.name, type_name, non_null ? "NO" : "YES"};
+      const MetaColumn &column = columns[row];
+      const std::string cells[] = {column.name, column.type, column.not_null ? "NO" : "YES"};
       for (int64_t col = 0; OB_SUCC(ret) && col < meta_columns; ++col) {
         ObObjParam value;
         if (col < 3) {
@@ -247,11 +182,12 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
   int ret = OB_SUCCESS;
   ObExplainStmt *explain_stmt = NULL;
   if (parse_tree.type_ == T_EXPLAIN && parse_tree.num_child_ == 5
+      && parse_tree.children_[EXPLAIN_FORMAT]
+      && parse_tree.children_[EXPLAIN_FORMAT]->type_ == T_TRADITIONAL
+      && parse_tree.children_[EXPLAIN_FORMAT]->value_ == 1
       && parse_tree.children_[EXPLAIN_CHILD_STMT]
       && parse_tree.children_[EXPLAIN_CHILD_STMT]->type_ == T_SELECT
       && nullptr != find_file_table(parse_tree.children_[EXPLAIN_CHILD_STMT])) {
-    // DESCRIBE and EXPLAIN share one parse tree today; a file table has no plan
-    // worth printing, so both forms describe the inferred file schema instead.
     return resolve_file_describe(*parse_tree.children_[EXPLAIN_CHILD_STMT]);
   }
   if (!(T_EXPLAIN == parse_tree.type_  && 5 == parse_tree.num_child_)) {
