@@ -385,6 +385,7 @@ END_P SET_VAR DELIMITER
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
 %type <node> explain_stmt explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
+%type <node> copy_stmt opt_copy_options copy_option_list copy_option
 %type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
 %type <node> column_ref multi_delete_table
 %type <node> case_expr func_expr in_expr sub_query_flag search_expr
@@ -558,6 +559,7 @@ opt_end_p:
 /* only preparable statement will set question mark size */
 stmt:
     select_stmt             { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -16642,6 +16644,34 @@ file_table_alias:
 /* empty */ %prec LOWER_PARENS { $$ = NULL; }
 | relation_name { $$ = $1; }
 | AS relation_name { $$ = $2; }
+;
+
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE opt_copy_options
+{
+  $6->is_forbid_parameter_ = true;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY, 3, $3, $6, $7);
+}
+;
+
+opt_copy_options:
+/* empty */ { $$ = NULL; }
+| '(' copy_option_list ')' { merge_nodes($$, result, T_EXPR_LIST, $2); }
+;
+
+copy_option_list:
+copy_option { $$ = $1; }
+| copy_option_list ',' copy_option
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+
+copy_option:
+relation_name
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 1, $1); }
+| relation_name relation_name
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
+| relation_name STRING_VALUE
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
 ;
 
 file_table_expr:
