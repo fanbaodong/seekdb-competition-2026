@@ -1,13 +1,90 @@
 """Numeric correctness and rejection cases; these tests never claim GPU execution."""
 import copy
 import math
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
 from benchmark import (assess_results, exact_neighbors, fingerprint, generate_data,
                        identifier, match_evidence, parse_options, query_sql,
-                       summarize, validate_comparable)
+                       summarize, validate_comparable, log_position, evidence_from_log,
+                       first_query_when_ready)
+
+
+class IndexReadinessTests(unittest.TestCase):
+    @patch('benchmark.time.sleep')
+    def test_transient_first_query_restarts_snapshot_and_records_error(self, sleep):
+        connection, cursor = Mock(), Mock()
+        cursor.execute.side_effect = [Exception(4016, 'not visible'), None]
+        cursor.fetchall.return_value = [(99, 0.0)]
+        rows, failures = first_query_when_ready(connection, cursor, 'SQL', ('v', 'v'))
+        self.assertEqual(rows, [(99, 0.0)])
+        self.assertEqual(failures, [4016])
+        connection.rollback.assert_called_once()
+        sleep.assert_called_once_with(0.1)
+
+    @patch('benchmark.time.sleep')
+    def test_permanent_failure_exhausts_the_bound(self, sleep):
+        connection, cursor = Mock(), Mock()
+        cursor.execute.side_effect = Exception(4016, 'still unavailable')
+        with self.assertRaises(Exception):
+            first_query_when_ready(connection, cursor, 'SQL', (), max_retries=2)
+        self.assertEqual(cursor.execute.call_count, 3)
+        self.assertEqual(connection.rollback.call_count, 2)
+        cursor.fetchall.assert_not_called()
+
+    @patch('benchmark.time.sleep')
+    def test_other_errors_are_not_retried(self, sleep):
+        connection, cursor = Mock(), Mock()
+        cursor.execute.side_effect = Exception(1064, 'syntax error')
+        with self.assertRaises(Exception):
+            first_query_when_ready(connection, cursor, 'SQL', ())
+        connection.rollback.assert_not_called()
+        sleep.assert_not_called()
+
+
+class RawBuildEvidenceTests(unittest.TestCase):
+    record = ('[seekdb-hipvs-build] backend=hipvs device_vendor=AMD '
+              'gpu_name="AMD Radeon Graphics" arch=gfx1100 rows=100 dim=8 '
+              'gpu_compute=true cpu_fallback=false export_completed=true\n')
+
+    def test_only_new_record_matches_the_timed_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stderr.log"
+            path.write_bytes(self.record.encode())
+            start = log_position(path)
+            with path.open("a", encoding="utf-8", newline="\n") as out:
+                out.write(self.record)
+            evidence = evidence_from_log(path, start, "table1", "idx1", 100, 8)
+            self.assertEqual(evidence["table_name"], "table1")
+            self.assertEqual(evidence["index_name"], "idx1")
+            self.assertEqual(evidence["stderr_start"], len(self.record))
+            self.assertEqual(evidence["raw_record"], self.record.rstrip())
+            self.assertEqual(len(evidence["stderr_interval_sha256"]), 64)
+
+    def test_missing_ambiguous_fallback_or_wrong_shape_is_rejected(self):
+        for data in ("", self.record * 2, self.record.replace("fallback=false", "fallback=true"),
+                     self.record.replace("rows=100", "rows=101"),
+                     self.record.replace("arch=gfx1100", "arch=sm80")):
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "stderr.log"
+                path.touch()
+                start = log_position(path)
+                path.write_bytes(data.encode())
+                with self.assertRaises(RuntimeError):
+                    evidence_from_log(path, start, "t", "i", 100, 8)
+
+    def test_log_truncation_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stderr.log"
+            path.write_bytes((self.record * 2).encode())
+            start = log_position(path)
+            path.write_bytes(self.record.encode())
+            with self.assertRaises(RuntimeError):
+                evidence_from_log(path, start, "t", "i", 100, 8)
 
 
 class NumericTests(unittest.TestCase):

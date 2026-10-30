@@ -22,6 +22,47 @@ IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 OPTION = re.compile(r"([a-z_][a-z0-9_]*)\s*=\s*([a-z_][a-z0-9_]*|[0-9]+(?:\.[0-9]+)?)\Z", re.I)
 HARDWARE_FIELDS = ("cpu_model", "cpu_threads", "cpu_affinity", "gpu_model", "gpu_architecture",
                    "rocm_version", "hipvs_version", "seekdb_commit")
+BUILD_LOG = re.compile(r'\[seekdb-hipvs-build\] backend=hipvs device_vendor=AMD '
+                       r'gpu_name="([^"\r\n]+)" arch=(gfx[0-9A-Za-z_:]+) '
+                       r'rows=([0-9]+) dim=([0-9]+) gpu_compute=true '
+                       r'cpu_fallback=false export_completed=true')
+
+
+def log_position(path: Path) -> tuple[int, int, int]:
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size
+
+
+def evidence_from_log(path: Path, start: tuple[int, int, int], table: str, index: str,
+                      rows: int, dim: int) -> dict:
+    """Correlate one isolated SQL CREATE with its raw, newly appended GPU record.
+
+    This mode requires a dedicated seekdb process without concurrent index DDL.
+    Rotation, absent records and multiple records fail instead of guessing.
+    """
+    with path.open("rb") as source:
+        info = os.fstat(source.fileno())
+        if (info.st_dev, info.st_ino) != start[:2] or info.st_size < start[2]:
+            raise RuntimeError("seekdb stderr rotated during timed index construction")
+        length = info.st_size - start[2]
+        if length > 16 * 1024 * 1024:
+            raise RuntimeError("Unexpectedly large stderr interval; inspect server log")
+        source.seek(start[2])
+        raw = source.read(length)
+    candidates = [line for line in raw.decode("utf-8", errors="replace").splitlines()
+                  if "[seekdb-hipvs-build]" in line]
+    if len(candidates) != 1:
+        raise RuntimeError("Missing or ambiguous GPU execution record during SQL CREATE")
+    match = BUILD_LOG.fullmatch(candidates[0])
+    if not match or (int(match[3]), int(match[4])) != (rows, dim):
+        raise RuntimeError("GPU execution record does not match the SQL input")
+    return {"producer": "seekdb-hipvs-build", "backend": "hipvs", "device_vendor": "AMD",
+            "gpu_compute": True, "cpu_fallback": False, "completed": True,
+            "rows": rows, "dim": dim, "gpu_name": match[1], "gpu_architecture": match[2],
+            "table_name": table, "index_name": index,
+            "correlation": "single build in dedicated server stderr during SQL CREATE and first ANN query",
+            "stderr_start": start[2], "stderr_end": start[2] + len(raw),
+            "stderr_interval_sha256": hashlib.sha256(raw).hexdigest(), "raw_record": candidates[0]}
 
 
 def identifier(value: str) -> str:
@@ -221,6 +262,24 @@ def vector_json(value) -> str:
     return json.dumps(np.asarray(value, dtype=np.float32).tolist(), separators=(",", ":"), allow_nan=False)
 
 
+def first_query_when_ready(connection, cursor, sql, values, max_retries=10):
+    """Bound the baseline's post-DDL snapshot visibility retries inside the timer."""
+    failures = []
+    while True:
+        try:
+            cursor.execute(sql, values)
+            return cursor.fetchall(), failures
+        except Exception as error:
+            code = error.args[0] if error.args and isinstance(error.args[0], int) else None
+            if code not in (4016, 4138) or len(failures) >= max_retries:
+                raise
+            failures.append(code)
+            # Discard a read snapshot older than the freshly created LOB tablets.
+            # Never reuse a failed result or skip the eventual ANN correctness checks.
+            connection.rollback()
+            time.sleep(0.1)
+
+
 def run_round(connection, report, mode, number, vectors, queries, ids, truth, options):
     cfg = report["config"]
     tag = report["run_id"]
@@ -229,14 +288,22 @@ def run_round(connection, report, mode, number, vectors, queries, ids, truth, op
     created = False
     cursor = connection.cursor()
     try:
+        # The session variable overrides the value stored in WITH(...).
+        cursor.execute("SET SESSION ob_hnsw_ef_search=%s", (int(options["ef_search"]),))
+        cursor.execute("SELECT @@session.ob_hnsw_ef_search")
+        if int(cursor.fetchone()[0]) != int(options["ef_search"]):
+            raise RuntimeError("Effective HNSW search breadth differs from the requested parameters")
+        report["active_operation"] = f"{mode}/{number}: create raw table"
         cursor.execute(f"CREATE TABLE {identifier(table)} (id BIGINT PRIMARY KEY, v VECTOR({cfg['dim']}) NOT NULL)")
         created = True
         started = time.perf_counter()
+        report["active_operation"] = f"{mode}/{number}: raw load"
         for begin in range(0, len(vectors), cfg["batch"]):
             batch = [(int(ids[i]), vector_json(vectors[i])) for i in range(begin, min(begin + cfg["batch"], len(vectors)))]
             cursor.executemany(f"INSERT INTO {identifier(table)} (id,v) VALUES (%s,%s)", batch)
         connection.commit()
         load_sec = time.perf_counter() - started
+        report["active_operation"] = f"{mode}/{number}: verify raw IDs"
         cursor.execute(f"SELECT id FROM {identifier(table)} ORDER BY id")
         if [int(row[0]) for row in cursor.fetchall()] != sorted(map(int, ids)):
             raise RuntimeError("Raw input row/ID verification failed")
@@ -245,21 +312,27 @@ def run_round(connection, report, mode, number, vectors, queries, ids, truth, op
             raise RuntimeError("Unexpected pre-existing index before timed build")
         sql = query_sql(table, index, cfg["k"])
         first = vector_json(queries[0])
+        log_path = Path(cfg["server_stderr"]) if cfg.get("server_stderr") else None
+        log_start = log_position(log_path) if mode == "gpu" and log_path else None
         # Start before DDL: scans, GPU transfers, synchronization, graph conversion and
         # the first usable ANN query are all inside this interval. No standalone kernel timing.
         started = time.perf_counter()
+        report["active_operation"] = f"{mode}/{number}: create vector index"
         cursor.execute(f"CREATE VECTOR INDEX {identifier(index)} ON {identifier(table)}(v) WITH ({options_sql(options)})")
         ddl_sec = time.perf_counter() - started
-        cursor.execute(sql, (first, first))
-        first_rows = cursor.fetchall()
+        report["active_operation"] = f"{mode}/{number}: first ANN query"
+        first_rows, readiness_retries = first_query_when_ready(connection, cursor, sql, (first, first))
         assess_results([first_rows], truth[:1], ids, cfg["k"])
         build_sec = time.perf_counter() - started
+        evidence = evidence_from_log(log_path, log_start, table, index, cfg["rows"], cfg["dim"]) if log_start else None
+        report["active_operation"] = f"{mode}/{number}: explain vector index"
         cursor.execute("EXPLAIN " + sql, (first, first))
         plan = "\n".join(str(row[0]) for row in cursor.fetchall())
         vector_plan = "VECTOR INDEX" in plan.upper() and index.lower() in plan.lower()
         if not vector_plan:
             raise RuntimeError("EXPLAIN does not prove the requested vector index is used")
         query_started = time.perf_counter()
+        report["active_operation"] = f"{mode}/{number}: recall queries"
         results = []
         for query in queries:
             parameter = vector_json(query)
@@ -270,20 +343,43 @@ def run_round(connection, report, mode, number, vectors, queries, ids, truth, op
         # Probe every input vector, not a sampled row count. ID mapping and omissions
         # must pass even when average Recall@K happens to meet its threshold.
         coverage_started = time.perf_counter()
+        report["active_operation"] = f"{mode}/{number}: full ID coverage"
+        # Coverage is a completeness diagnostic, distinct from Recall@K at the
+        # configured search breadth. Retry only missed self matches at full
+        # breadth; every input is still queried, with the same rules in both modes.
+        coverage_ef = min(160000, max(int(options["ef_search"]), cfg["rows"]))
         found = 0
+        missed = []
         self_sql = query_sql(table, index, 1)
-        for vector, doc_id in zip(vectors, ids):
+        for position, (vector, doc_id) in enumerate(zip(vectors, ids), 1):
             parameter = vector_json(vector)
             cursor.execute(self_sql, (parameter, parameter))
             own = cursor.fetchall()
             if len(own) == 1 and int(own[0][0]) == int(doc_id) and abs(float(own[0][1])) < 1e-6:
                 found += 1
+            else:
+                missed.append((parameter, int(doc_id)))
+            if position % 1000 == 0:
+                print(f"{mode}/{number}: checked {position}/{len(ids)} input IDs", flush=True)
+        if missed:
+            cursor.execute("SET SESSION ob_hnsw_ef_search=%s", (coverage_ef,))
+            for parameter, doc_id in missed:
+                cursor.execute(self_sql, (parameter, parameter))
+                own = cursor.fetchall()
+                if len(own) == 1 and int(own[0][0]) == doc_id and abs(float(own[0][1])) < 1e-6:
+                    found += 1
         result = {"mode": mode, "round": number, "table_name": table, "index_name": index,
                   "raw_load_sec": load_sec, "ddl_sec": ddl_sec, "build_sec": build_sec,
+                  "readiness_retry_codes": readiness_retries,
+                  "query_ef_search": int(options["ef_search"]), "coverage_ef_search": coverage_ef,
+                  "coverage_retry_count": len(missed),
                   "query_sec": query_sec, "coverage_sec": time.perf_counter() - coverage_started,
                   "coverage_found": found, "quality": quality, "vector_plan_verified": vector_plan,
                   "query_plan": plan, "with": options}
+        if evidence:
+            result["raw_gpu_evidence"] = evidence
         report["rounds"].append(result)
+        report["active_operation"] = None
         print(json.dumps({"mode": mode, "round": number, "index_name": index, "build_sec": build_sec,
                           "recall_at_k": quality["recall_at_k"], "coverage_found": found}), flush=True)
     finally:
@@ -335,6 +431,8 @@ def arguments(argv=None):
     parser.add_argument("--target-speedup", type=float, help="Use the published target, otherwise target remains unspecified")
     parser.add_argument("--evidence-jsonl", type=Path)
     parser.add_argument("--environment-json", type=Path)
+    parser.add_argument("--server-stderr", type=Path,
+                        help="Dedicated seekdb stderr file; no concurrent index builds permitted")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.repeats < 3 or not 1 <= args.k <= args.rows or args.queries < 1 or args.batch < 1 or args.timeout_sec < 1:
@@ -358,6 +456,7 @@ def main(argv=None):
         source = json.loads(args.environment_json.read_text(encoding="utf-8"))
         server_environment = {field: source[field] for field in HARDWARE_FIELDS if field in source}
     config = {key: getattr(args, key) for key in ("rows", "dim", "queries", "k", "seed", "repeats", "batch", "min_recall", "target_speedup", "timeout_sec", "cpu_only")}
+    config["server_stderr"] = str(args.server_stderr) if args.server_stderr else None
     report = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
               "run_id": uuid.uuid4().hex[:16], "config": config, "cpu_with": cpu, "gpu_with": gpu,
               "driver_environment": {"python": platform.python_version(), "numpy": np.__version__, "os": platform.platform()},
@@ -388,6 +487,7 @@ def main(argv=None):
                 report["summary"] = summarize(report, [])
                 save_report(report, args.output)
         records = read_evidence(args.evidence_jsonl)
+        records += [row["raw_gpu_evidence"] for row in report["rounds"] if "raw_gpu_evidence" in row]
         report["summary"] = summarize(report, records)
         if args.evidence_jsonl:
             report["evidence_sha256"] = hashlib.sha256(args.evidence_jsonl.read_bytes()).hexdigest()

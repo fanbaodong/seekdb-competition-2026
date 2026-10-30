@@ -1,13 +1,19 @@
 """Small real-GPU bridge check, NOT the SQL end-to-end build benchmark."""
 import ctypes
+import argparse
 import json
 import pathlib
 import struct
 import time
 import numpy as np
 
-root = pathlib.Path('/workspace/amd-build')
-library = ctypes.CDLL(str(root / 'libseekdb_hipvs_build.so'))
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--output-dir', type=pathlib.Path, default=pathlib.Path('/workspace/amd-build'))
+parser.add_argument('--library', type=pathlib.Path)
+args = parser.parse_args()
+root = args.output_dir.resolve()
+root.mkdir(parents=True, exist_ok=True)
+library = ctypes.CDLL(str(args.library.resolve() if args.library else root / 'libseekdb_hipvs_build.so'))
 build = library.seekdb_hipvs_build_hnsw_v1
 build.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_int64, ctypes.c_int32,
                  ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_char_p,

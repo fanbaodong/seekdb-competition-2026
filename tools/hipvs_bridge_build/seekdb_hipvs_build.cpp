@@ -39,6 +39,9 @@ struct Job {
 void *run_build(void *opaque)
 {
   Job &job = *static_cast<Job *>(opaque);
+  // Keep destruction inside the same critical section as construction: the
+  // process-wide hipVS allocator must not be torn down during another build.
+  std::lock_guard<std::mutex> lock(build_mutex);
   cuvsResources_t resources = 0;
   cuvsCagraIndexParams_t cp = nullptr;
   cuvsCagraIndex_t ci = nullptr;
@@ -46,7 +49,6 @@ void *run_build(void *opaque)
   cuvsHnswIndex_t hi = nullptr;
   bool have_resources = false;
   try {
-    std::lock_guard<std::mutex> lock(build_mutex);
     int count = 0;
     check_hip(hipGetDeviceCount(&count), "hipGetDeviceCount");
     if (count < 1) throw std::runtime_error("no AMD GPU available; CPU fallback is disabled");
