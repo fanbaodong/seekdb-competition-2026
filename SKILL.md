@@ -1,6 +1,6 @@
 ---
 name: seekdb-file-sql
-description: 用 seekdb 的文件 SQL 直接查询本地 CSV、JSONL、Parquet 文件（read_csv、read_json、glob、read_parquet、DESCRIBE、COPY），无需建表或导入数据。Use when the user asks to explore, profile, aggregate, join, or export local data files with SQL.
+description: 用 seekdb 的文件 SQL 直接查询本地 CSV、JSONL、Parquet 文件（read_csv、read_json、glob、read_parquet、DESCRIBE、COPY），无需建表导入。Use for local data-file exploration, aggregation and export with SQL.
 license: Apache-2.0
 version: 1.0.0
 metadata:
