@@ -1,0 +1,71 @@
+# AMD hipVS 端到端构建评估工具
+
+本工具调用真正的 seekdb SQL 建索引及查询接口，不提供 GPU 模拟器，不把 CPU 回退或独立查询演示计作构建加速。GPU 实现与实测完成之前，本目录的存在不代表 AMD 题已通过。
+
+## 运行环境
+
+Python 3.12、`requirements.txt` 中的依赖；能够访问待测 seekdb 的 MySQL 协议端口。GPU 组的数据库进程须运行在正确配置的 AMD ROCm/hipVS 实例上。服务器镜像/驱动应以该实例实际 GPU 型号的支持矩阵为准。
+
+在本目录创建虚拟环境并安装依赖：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m unittest discover -v
+```
+
+连接由环境变量提供：`AMD_BENCH_HOST`（默认127.0.0.1）、`AMD_BENCH_PORT`（默认2881）、`AMD_BENCH_USER`（默认root）、`AMD_BENCH_PASSWORD`、`AMD_BENCH_DATABASE`（默认test）。不要把密码放入命令参数、报告或Git。账号需要在此专用数据库创建/删除表和向量索引的权限。工具不会创建或删除整个数据库；每轮创建带随机run ID的新表，只清理自身成功创建的表。若进程被强制终止，可根据报告中的准确表名人工清理残留；不要按模糊前缀删除其他表。
+
+## CPU基线检查
+
+以下仅为小规模功能冒烟参数，**不是赛事评分数据规模或质量门槛**：
+
+```bash
+python benchmark.py --cpu-only --rows 200 --dim 16 --queries 20 --k 10 \
+  --repeats 3 --min-recall 0.90 --output local-results/cpu-smoke.json
+```
+
+报告状态只能为`CPU_ONLY`，不会给出GPU成绩。公开参数默认CPU索引为`distance=l2,type=hnsw,lib=vsag,m=16,ef_construction=200,ef_search=200`。SQL语法依据同仓库`tools/deploy/mysql_test/test_suite/vector_index/t/`测试，查询使用`INDEX(t index_name)`提示及`APPROXIMATE LIMIT`，并检查EXPLAIN确实使用指定向量索引。
+
+## CPU/GPU对比
+
+`--gpu-with`必须填写**已经实现并验证的GPU路径**所用WITH参数，工具不猜测`lib=cuvs`等尚未接入的语法。CPU/GPU的`distance/type/m/ef_construction/ef_search`必须显式相同；本版本仅支持FP32、L2、HNSW。`--rows/--dim/--queries/--k/--min-recall/--target-speedup`应采用赛事统一评测配置；未知目标时省略`--target-speedup`，不会声称达到赛事目标。
+
+环境文件`--environment-json`记录服务器的`cpu_model`、`cpu_threads`、`cpu_affinity`、`gpu_model`、`gpu_architecture`、`rocm_version`、`hipvs_version`、`seekdb_commit`。这些是服务器信息，不能使用客户端笔记本配置替代。字段缺失时对比结论是`UNVERIFIED`。不要在环境文件保存账户密码、SSH地址或令牌。
+
+运行至少三轮。每轮CPU/GPU顺序交替。脚本记录以下独立阶段：
+
+1. 固定随机种子生成FP32向量、查询与非连续BIGINT主键，保存SHA256数据指纹；精确近邻真值用同一FP32数据的FP64距离累加计算。
+2. 每组新建无向量索引的独立表，导入完全相同数据。数据生成和导入不计入构建加速比。
+3. 验证全部原始ID及不存在旧向量索引，从`CREATE VECTOR INDEX`开始计时，至首次指定索引ANN查询完成结束。此区间包含扫描、GPU传输/同步、格式转换、DDL以及首次查询可能触发的延迟构建。
+4. 使用相同查询集校验Recall@K，拒绝未知ID、重复ID、ID精度丢失、非法距离、结果数量不完整、未使用向量索引等结果。随后以每个输入向量做自身最近邻查询，校验全部文档ID映射，没有抽样省略。
+5. 分别取CPU和GPU构建耗时中位数，**不是各轮加速比的平均数**。每一轮均须满足质量和完整性条件。
+
+JSON保存每轮耗时、SQL参数、查询计划、Recall、ID覆盖、数据指纹及服务器软件/硬件信息，同名Markdown便于阅读。不能把本工具随机资料换成更少数据/更低精度来宣称满足统一评测。
+
+## GPU证据接口
+
+`--evidence-jsonl`读取**由待测seekdb构建后端实际产生/导出的**逐索引JSONL记录；不可手写成功记录补成绩。每轮随机`table_name/index_name`必须匹配唯一完成记录，同时包含：
+
+|字段|要求|
+|---|---|
+|producer|`seekdb-hipvs-build`|
+|backend|`hipvs`|
+|device_vendor|`AMD`|
+|gpu_compute|布尔true，表明GPU参与构建核心计算|
+|cpu_fallback|布尔false|
+|completed|布尔true|
+|rows/dim|与完整本轮数据一致的整数|
+|gpu_name|实际GPU型号|
+|table_name/index_name|本轮准确标识|
+
+这是对接约定，不代表当前seekdb分支已实现该日志接口。接入层若采用不同格式，应先从真实原始记录做明确转换并保留原始证据，而非伪造该JSONL。脚本保存输入证据文件SHA256便于核对；JSONL本身并非防篡改签名，还需要原始日志/性能分析记录作为归属证据。缺少证据、出现CPU回退、记录不完整或硬件元数据缺失时，报告`UNVERIFIED`，有效加速比为null，即使SQL成功也不计算GPU成绩。
+
+## 退出状态与限制
+
+- 退出0：`CPU_ONLY`基线完成、`MEASURED_TARGET_UNSPECIFIED`已测但目标未提供、或`PASS`达到操作者明确输入的门槛。请同时阅读状态，不把退出0直接当作赛事通过。
+- 退出2：不完整、运行错误、质量/功能失败、证据缺失或未达到性能目标。
+- 测量包含客户端往返开销；CPU/GPU应使用同一连接位置和固定CPU配额，不在并行负载下运行。
+- 本脚本不验证数据库进程重启恢复、不代替内核泄漏检查或GPU性能分析；这些证据需另行补充。
+- 本工具不修改全局数据库配置，不以平台的查询加速参考结果代替构建实测。

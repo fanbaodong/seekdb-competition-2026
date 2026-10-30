@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Real seekdb SQL build benchmark. No simulated GPU timings or fallback credit."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import re
+import statistics
+import sys
+import time
+from datetime import datetime, timezone
+import uuid
+
+import numpy as np
+
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+OPTION = re.compile(r"([a-z_][a-z0-9_]*)\s*=\s*([a-z_][a-z0-9_]*|[0-9]+(?:\.[0-9]+)?)\Z", re.I)
+HARDWARE_FIELDS = ("cpu_model", "cpu_threads", "cpu_affinity", "gpu_model", "gpu_architecture",
+                   "rocm_version", "hipvs_version", "seekdb_commit")
+
+
+def identifier(value: str) -> str:
+    if not IDENTIFIER.fullmatch(value):
+        raise ValueError("Unsafe SQL identifier")
+    return "`" + value + "`"
+
+
+def parse_options(value: str) -> dict[str, str]:
+    options = {}
+    for item in value.split(","):
+        match = OPTION.fullmatch(item.strip())
+        if not match or match[1].lower() in options:
+            raise ValueError("WITH options must be unique name=value pairs without SQL fragments")
+        options[match[1].lower()] = match[2].lower()
+    return options
+
+
+def options_sql(options: dict[str, str]) -> str:
+    # Always round-trip through the same strict grammar before SQL interpolation.
+    value = ",".join(f"{key}={item}" for key, item in sorted(options.items()))
+    parse_options(value)
+    return value
+
+
+def validate_comparable(cpu: dict, gpu: dict, k: int) -> None:
+    for options in (cpu, gpu):
+        if options.get("distance") != "l2" or options.get("type") != "hnsw":
+            raise ValueError("This harness compares FP32 HNSW using L2 distance only")
+        for key in ("m", "ef_construction", "ef_search"):
+            if not re.fullmatch(r"[0-9]+", options.get(key, "")):
+                raise ValueError(f"Explicit integer {key} is required")
+        if not 5 <= int(options["m"]) <= 64:
+            raise ValueError("m must be in [5,64]")
+        if not int(options["m"]) <= int(options["ef_construction"]) <= 1000:
+            raise ValueError("ef_construction must be between m and 1000")
+        if not k <= int(options["ef_search"]) <= 160000:
+            raise ValueError("ef_search must be between K and 160000")
+    for key in ("distance", "type", "m", "ef_construction", "ef_search"):
+        if cpu[key] != gpu[key]:
+            raise ValueError(f"CPU/GPU {key} parameters must match")
+    if cpu.get("lib") != "vsag":
+        raise ValueError("CPU baseline must explicitly use lib=vsag")
+
+
+def generate_data(rows: int, dim: int, queries: int, seed: int):
+    if rows < 2 or not 1 <= dim <= 16384 or queries < 1:
+        raise ValueError("rows>=2, queries>=1 and 1<=dim<=16384 required")
+    rng = np.random.default_rng(seed)
+    vectors = rng.standard_normal((rows, dim)).astype(np.float32)
+    query = rng.standard_normal((queries, dim)).astype(np.float32)
+    # Above 2**53, so accidental JSON float ID conversions are detectable.
+    ids = (np.arange(rows, dtype=np.int64) * 104729) + (2**53 + 101)
+    if ids[-1] > np.iinfo(np.int64).max:
+        raise ValueError("Document IDs exceed signed BIGINT")
+    rng.shuffle(ids)
+    return vectors, query, ids
+
+
+def fingerprint(vectors, queries, ids) -> str:
+    digest = hashlib.sha256()
+    for array, dtype in ((vectors, "<f4"), (queries, "<f4"), (ids, "<i8")):
+        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+        digest.update(np.asarray(array, dtype=dtype).tobytes())
+    return digest.hexdigest()
+
+
+def exact_neighbors(vectors, queries, ids, k: int):
+    if not 1 <= k <= len(vectors):
+        raise ValueError("K must be between 1 and row count")
+    if not np.isfinite(vectors).all() or not np.isfinite(queries).all():
+        raise ValueError("All coordinates must be finite")
+    if len(set(map(int, ids))) != len(vectors):
+        raise ValueError("Document IDs must be unique")
+    # Float64 accumulation on the exact stored FP32 values; bounded one-query memory.
+    data64 = np.asarray(vectors, dtype=np.float64)
+    result = []
+    for query in queries:
+        delta = data64 - np.asarray(query, dtype=np.float64)
+        squared = np.einsum("ij,ij->i", delta, delta)
+        order = np.lexsort((ids, squared))[:k]
+        result.append([int(value) for value in ids[order]])
+    return result
+
+
+def assess_results(results, truth, allowed_ids, k: int) -> dict:
+    if not truth or len(results) != len(truth):
+        raise ValueError("Result/query count mismatch")
+    allowed = set(map(int, allowed_ids))
+    recalls = []
+    for rows, expected in zip(results, truth):
+        if len(rows) != k:
+            raise ValueError("ANN returned an incomplete result set")
+        actual = []
+        previous = -math.inf
+        for doc_id, distance in rows:
+            if not isinstance(doc_id, (int, np.integer)) or isinstance(doc_id, bool):
+                raise ValueError("ANN document ID is not an exact integer")
+            if int(doc_id) not in allowed:
+                raise ValueError("ANN returned a document ID absent from the input")
+            distance = float(distance)
+            if not math.isfinite(distance) or distance < 0:
+                raise ValueError("ANN returned an invalid L2 distance")
+            if distance + 1e-6 < previous:
+                raise ValueError("ANN returned unsorted distances")
+            previous = distance
+            actual.append(int(doc_id))
+        if len(set(actual)) != k:
+            raise ValueError("ANN returned duplicate IDs")
+        recalls.append(len(set(actual).intersection(expected)) / k)
+    return {"recall_at_k": statistics.mean(recalls), "min_query_recall": min(recalls),
+            "queries": len(truth), "valid_ids": True}
+
+
+def read_evidence(path: Path | None) -> list[dict]:
+    if path is None:
+        return []
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict):
+            raise ValueError("Evidence must contain JSON objects, one per line")
+        records.append(item)
+    return records
+
+
+def match_evidence(round_result: dict, records: list[dict], rows: int, dim: int):
+    matches = [item for item in records if item.get("index_name") == round_result["index_name"]
+               and item.get("table_name") == round_result["table_name"]]
+    if len(matches) != 1:
+        return None, "missing or ambiguous per-index GPU build evidence"
+    item = matches[0]
+    expected = {"producer": "seekdb-hipvs-build", "backend": "hipvs", "device_vendor": "AMD",
+                "gpu_compute": True, "cpu_fallback": False, "completed": True,
+                "rows": rows, "dim": dim}
+    for key, value in expected.items():
+        if type(item.get(key)) is not type(value) or item[key] != value:
+            return None, f"GPU build evidence rejected: {key}"
+    if not isinstance(item.get("gpu_name"), str) or not item["gpu_name"].strip():
+        return None, "GPU build evidence missing gpu_name"
+    # Only propagate known non-secret fields, never arbitrary log/environment contents.
+    clean = {key: item[key] for key in expected}
+    clean.update({key: item[key] for key in ("gpu_name", "table_name", "index_name")})
+    return clean, None
+
+
+def summarize(report: dict, records: list[dict]) -> dict:
+    rounds = report["rounds"]
+    cpu = [item for item in rounds if item["mode"] == "cpu"]
+    gpu = [item for item in rounds if item["mode"] == "gpu"]
+    summary = {"status": "INCOMPLETE", "speedup": None, "meets_target": False}
+    summary["cpu_median_build_sec"] = statistics.median([item["build_sec"] for item in cpu]) if cpu else None
+    summary["gpu_median_build_sec"] = statistics.median([item["build_sec"] for item in gpu]) if gpu else None
+    if len(cpu) != report["config"]["repeats"] or (not report["config"]["cpu_only"] and len(gpu) != len(cpu)):
+        return summary
+    if any(not math.isfinite(item["build_sec"]) or item["build_sec"] <= 0 for item in rounds):
+        raise ValueError("Build durations must be finite and positive")
+    if any(item["quality"]["recall_at_k"] < report["config"]["min_recall"]
+           or item["coverage_found"] != report["config"]["rows"]
+           or not item.get("vector_plan_verified") for item in rounds):
+        summary["status"] = "QUALITY_OR_FUNCTION_FAILED"
+        return summary
+    if report["config"]["cpu_only"]:
+        summary["status"] = "CPU_ONLY"
+        return summary
+    reasons = []
+    for item in gpu:
+        item["gpu_evidence"], error = match_evidence(item, records, report["config"]["rows"], report["config"]["dim"])
+        if error:
+            reasons.append(f"{item['index_name']}: {error}")
+    missing_hardware = [field for field in HARDWARE_FIELDS if not report.get("server_environment", {}).get(field)]
+    if reasons or missing_hardware:
+        summary.update(status="UNVERIFIED", reasons=reasons, missing_server_environment=missing_hardware)
+        return summary
+    summary["speedup"] = summary["cpu_median_build_sec"] / summary["gpu_median_build_sec"]
+    target = report["config"]["target_speedup"]
+    if target is None:
+        summary["status"] = "MEASURED_TARGET_UNSPECIFIED"
+    else:
+        summary["meets_target"] = summary["speedup"] >= target
+        summary["status"] = "PASS" if summary["meets_target"] else "PERFORMANCE_TARGET_NOT_MET"
+    return summary
+
+
+def query_sql(table: str, index: str, k: int) -> str:
+    if not isinstance(k, int) or k < 1:
+        raise ValueError("Invalid query K")
+    identifier(table)
+    identifier(index)
+    return (f"SELECT /*+ INDEX(t {index}) */ id, l2_distance(v, %s) AS distance "
+            f"FROM {identifier(table)} t ORDER BY l2_distance(v, %s) APPROXIMATE LIMIT {k}")
+
+
+def vector_json(value) -> str:
+    return json.dumps(np.asarray(value, dtype=np.float32).tolist(), separators=(",", ":"), allow_nan=False)
+
+
+def run_round(connection, report, mode, number, vectors, queries, ids, truth, options):
+    cfg = report["config"]
+    tag = report["run_id"]
+    table = f"ahb_{tag}_{mode}_{number}"
+    index = f"ahb_idx_{tag}_{mode}_{number}"
+    created = False
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"CREATE TABLE {identifier(table)} (id BIGINT PRIMARY KEY, v VECTOR({cfg['dim']}) NOT NULL)")
+        created = True
+        started = time.perf_counter()
+        for begin in range(0, len(vectors), cfg["batch"]):
+            batch = [(int(ids[i]), vector_json(vectors[i])) for i in range(begin, min(begin + cfg["batch"], len(vectors)))]
+            cursor.executemany(f"INSERT INTO {identifier(table)} (id,v) VALUES (%s,%s)", batch)
+        connection.commit()
+        load_sec = time.perf_counter() - started
+        cursor.execute(f"SELECT id FROM {identifier(table)} ORDER BY id")
+        if [int(row[0]) for row in cursor.fetchall()] != sorted(map(int, ids)):
+            raise RuntimeError("Raw input row/ID verification failed")
+        cursor.execute(f"SHOW INDEX FROM {identifier(table)}")
+        if any(row[2] != "PRIMARY" for row in cursor.fetchall()):
+            raise RuntimeError("Unexpected pre-existing index before timed build")
+        sql = query_sql(table, index, cfg["k"])
+        first = vector_json(queries[0])
+        # Start before DDL: scans, GPU transfers, synchronization, graph conversion and
+        # the first usable ANN query are all inside this interval. No standalone kernel timing.
+        started = time.perf_counter()
+        cursor.execute(f"CREATE VECTOR INDEX {identifier(index)} ON {identifier(table)}(v) WITH ({options_sql(options)})")
+        ddl_sec = time.perf_counter() - started
+        cursor.execute(sql, (first, first))
+        first_rows = cursor.fetchall()
+        assess_results([first_rows], truth[:1], ids, cfg["k"])
+        build_sec = time.perf_counter() - started
+        cursor.execute("EXPLAIN " + sql, (first, first))
+        plan = "\n".join(str(row[0]) for row in cursor.fetchall())
+        vector_plan = "VECTOR INDEX" in plan.upper() and index.lower() in plan.lower()
+        if not vector_plan:
+            raise RuntimeError("EXPLAIN does not prove the requested vector index is used")
+        query_started = time.perf_counter()
+        results = []
+        for query in queries:
+            parameter = vector_json(query)
+            cursor.execute(sql, (parameter, parameter))
+            results.append(cursor.fetchall())
+        query_sec = time.perf_counter() - query_started
+        quality = assess_results(results, truth, ids, cfg["k"])
+        # Probe every input vector, not a sampled row count. ID mapping and omissions
+        # must pass even when average Recall@K happens to meet its threshold.
+        coverage_started = time.perf_counter()
+        found = 0
+        self_sql = query_sql(table, index, 1)
+        for vector, doc_id in zip(vectors, ids):
+            parameter = vector_json(vector)
+            cursor.execute(self_sql, (parameter, parameter))
+            own = cursor.fetchall()
+            if len(own) == 1 and int(own[0][0]) == int(doc_id) and abs(float(own[0][1])) < 1e-6:
+                found += 1
+        result = {"mode": mode, "round": number, "table_name": table, "index_name": index,
+                  "raw_load_sec": load_sec, "ddl_sec": ddl_sec, "build_sec": build_sec,
+                  "query_sec": query_sec, "coverage_sec": time.perf_counter() - coverage_started,
+                  "coverage_found": found, "quality": quality, "vector_plan_verified": vector_plan,
+                  "query_plan": plan, "with": options}
+        report["rounds"].append(result)
+        print(json.dumps({"mode": mode, "round": number, "index_name": index, "build_sec": build_sec,
+                          "recall_at_k": quality["recall_at_k"], "coverage_found": found}), flush=True)
+    finally:
+        try:
+            if created:
+                # Only this process's successful CREATE is ever eligible for deletion.
+                cursor.execute(f"DROP TABLE {identifier(table)}")
+        finally:
+            cursor.close()
+
+
+def save_report(report: dict, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    summary = report["summary"]
+    lines = ["# AMD hipVS 端到端构建实测", "", f"状态：**{summary['status']}**", "",
+             "计时范围：CREATE VECTOR INDEX 开始至首条指定索引 ANN 查询完成；数据生成、原始导入及质量检查另计。", "",
+             "|路径|轮次|导入秒|DDL秒|端到端构建秒|Recall@K|全部输入ID自检|", "|---|---:|---:|---:|---:|---:|---:|"]
+    for row in report["rounds"]:
+        lines.append(f"|{row['mode']}|{row['round']}|{row['raw_load_sec']:.6f}|{row['ddl_sec']:.6f}|{row['build_sec']:.6f}|{row['quality']['recall_at_k']:.6f}|{row['coverage_found']}/{report['config']['rows']}|")
+    lines += ["", f"CPU中位数：{summary.get('cpu_median_build_sec')} 秒。",
+              f"GPU中位数：{summary.get('gpu_median_build_sec')} 秒。",
+              f"有效构建加速比：{summary.get('speedup') if summary.get('speedup') is not None else '未验证，不给出加速成绩'}。",
+              f"配置的质量门槛：{report['config']['min_recall']}；配置的性能目标：{report['config']['target_speedup']}。",
+              "目标值由操作者按统一评测配置提供，本工具不声称其即为赛事已公布标准。",
+              "", "GPU路径证明必须来自对应seekdb构建过程的原始日志/分析证据；同名库、GPU查询耗时或CPU回退不能代替。",
+              "完整配置、每轮原始记录、数据指纹、服务器环境及校验原因见同名JSON。"]
+    if report.get("failure"):
+        lines += ["", "运行发生错误；报告仅保留已经完成的轮次，不视为完成评测。", report["failure"]]
+    if summary.get("reasons") or summary.get("missing_server_environment"):
+        lines += ["", "未验证原因：", json.dumps({key: summary.get(key) for key in ("reasons", "missing_server_environment")}, ensure_ascii=False)]
+    destination.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def arguments(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rows", type=int, default=10000)
+    parser.add_argument("--dim", type=int, default=128)
+    parser.add_argument("--queries", type=int, default=200)
+    parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=20261031)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--batch", type=int, default=500)
+    parser.add_argument("--timeout-sec", type=int, default=3600)
+    parser.add_argument("--cpu-with", default="distance=l2,type=hnsw,lib=vsag,m=16,ef_construction=200,ef_search=200")
+    parser.add_argument("--gpu-with", help="Explicit implemented GPU WITH parameters; never guessed by this harness")
+    parser.add_argument("--cpu-only", action="store_true", help="Baseline smoke/measurement only; never GPU acceptance")
+    parser.add_argument("--min-recall", type=float, required=True, help="Use the published evaluation threshold")
+    parser.add_argument("--target-speedup", type=float, help="Use the published target, otherwise target remains unspecified")
+    parser.add_argument("--evidence-jsonl", type=Path)
+    parser.add_argument("--environment-json", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+    if args.repeats < 3 or not 1 <= args.k <= args.rows or args.queries < 1 or args.batch < 1 or args.timeout_sec < 1:
+        parser.error("At least 3 repeats, rows>=K>=1 and positive queries, batch, timeout required")
+    if not 0 < args.min_recall <= 1 or (args.target_speedup is not None and (not math.isfinite(args.target_speedup) or args.target_speedup <= 0)):
+        parser.error("Recall must be in (0,1]; target speedup must be finite and positive")
+    if not args.cpu_only and not args.gpu_with:
+        parser.error("--gpu-with is required unless --cpu-only is selected")
+    return args
+
+
+def main(argv=None):
+    args = arguments(argv)
+    cpu = parse_options(args.cpu_with)
+    gpu = parse_options(args.gpu_with) if args.gpu_with else dict(cpu)
+    validate_comparable(cpu, gpu, args.k)
+    database = os.environ.get("AMD_BENCH_DATABASE", "test")
+    identifier(database)
+    server_environment = {}
+    if args.environment_json:
+        source = json.loads(args.environment_json.read_text(encoding="utf-8"))
+        server_environment = {field: source[field] for field in HARDWARE_FIELDS if field in source}
+    config = {key: getattr(args, key) for key in ("rows", "dim", "queries", "k", "seed", "repeats", "batch", "min_recall", "target_speedup", "timeout_sec", "cpu_only")}
+    report = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
+              "run_id": uuid.uuid4().hex[:16], "config": config, "cpu_with": cpu, "gpu_with": gpu,
+              "driver_environment": {"python": platform.python_version(), "numpy": np.__version__, "os": platform.platform()},
+              "server_environment": server_environment, "rounds": [], "summary": {"status": "INCOMPLETE"}}
+    connection = None
+    try:
+        started = time.perf_counter()
+        vectors, queries, ids = generate_data(args.rows, args.dim, args.queries, args.seed)
+        report["data_generation_sec"] = time.perf_counter() - started
+        report["dataset_sha256"] = fingerprint(vectors, queries, ids)
+        started = time.perf_counter()
+        truth = exact_neighbors(vectors, queries, ids, args.k)
+        report["ground_truth_sec"] = time.perf_counter() - started
+        import pymysql
+        connection = pymysql.connect(host=os.environ.get("AMD_BENCH_HOST", "127.0.0.1"),
+            port=int(os.environ.get("AMD_BENCH_PORT", "2881")), user=os.environ.get("AMD_BENCH_USER", "root"),
+            password=os.environ.get("AMD_BENCH_PASSWORD", ""), database=database, autocommit=False,
+            charset="utf8mb4", connect_timeout=15, read_timeout=args.timeout_sec + 30, write_timeout=args.timeout_sec + 30)
+        with connection.cursor() as cursor:
+            cursor.execute("SET SESSION ob_query_timeout=%s", (args.timeout_sec * 1000000,))
+            cursor.execute("SET SESSION ob_trx_timeout=%s", (args.timeout_sec * 1000000,))
+            cursor.execute("SELECT VERSION()")
+            report["server_version"] = cursor.fetchone()[0]
+        for number in range(1, args.repeats + 1):
+            order = ("cpu",) if args.cpu_only else (("cpu", "gpu") if number % 2 else ("gpu", "cpu"))
+            for mode in order:
+                run_round(connection, report, mode, number, vectors, queries, ids, truth, cpu if mode == "cpu" else gpu)
+                report["summary"] = summarize(report, [])
+                save_report(report, args.output)
+        records = read_evidence(args.evidence_jsonl)
+        report["summary"] = summarize(report, records)
+        if args.evidence_jsonl:
+            report["evidence_sha256"] = hashlib.sha256(args.evidence_jsonl.read_bytes()).hexdigest()
+    except Exception as error:
+        # Connection errors may include account/host information; report type+numeric code
+        # instead of echoing credentials, arbitrary SQL, or complete driver exceptions.
+        code = error.args[0] if error.args and isinstance(error.args[0], int) else None
+        report["failure"] = f"{type(error).__name__}; error_code={code}; completed_rounds={len(report['rounds'])}"
+        report["summary"] = {"status": "ERROR", "speedup": None, "meets_target": False}
+        print(report["failure"], file=sys.stderr)
+    finally:
+        if connection:
+            connection.close()
+        save_report(report, args.output)
+    print(json.dumps(report["summary"], ensure_ascii=False))
+    return 0 if report["summary"]["status"] in ("PASS", "CPU_ONLY", "MEASURED_TARGET_UNSPECIFIED") else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
