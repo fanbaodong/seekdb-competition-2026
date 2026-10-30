@@ -65,22 +65,35 @@ bool compare_ascii_general_ci(const ObDatum &left, const ObDatum &right, int &cm
   return true;
 }
 
-// Repeated fulltext words are often byte-identical. Avoid decoding the same
-// UTF-8 word on every sort comparison. Match the comparator function itself,
-// so LOB locators, other data types and other collations retain their behavior.
-int compare_repeated_sort_key(const ObDatum &left, const ObDatum &right,
-                             const ObDatumCmpFuncType cmp_func, int &cmp,
-                             const ObDatumAccessContext *access_ctx)
+using KeyCompareKind = ObSortOpImpl::Compare::KeyCompareKind;
+
+// Match the function itself, not just the collation: LOB locators, other data
+// types and other comparison rules must keep their original implementation.
+KeyCompareKind classify_sort_key(const ObDatumCmpFuncType cmp_func)
 {
   static const ObDatumBasicFuncs *binary = ObDatumFuncs::get_basic_func(ObVarcharType, CS_TYPE_BINARY);
   static const ObDatumBasicFuncs *utf8 = ObDatumFuncs::get_basic_func(ObVarcharType, CS_TYPE_UTF8MB4_GENERAL_CI);
-  if (left.is_null() || right.is_null() || left.is_ext() || right.is_ext()) {
+  return cmp_func == binary->null_first_cmp_ || cmp_func == binary->null_last_cmp_
+      ? KeyCompareKind::BINARY_STRING
+      : cmp_func == utf8->null_first_cmp_ || cmp_func == utf8->null_last_cmp_
+      ? KeyCompareKind::UTF8_GENERAL_CI_STRING : KeyCompareKind::ORIGINAL;
+}
+
+// Repeated fulltext words are often byte-identical. Avoid decoding the same
+// UTF-8 word on every sort comparison. The kind is cached by Compare::init for
+// common short key lists; longer lists retain the same classification fallback.
+int compare_repeated_sort_key(const ObDatum &left, const ObDatum &right,
+                             const ObDatumCmpFuncType cmp_func, const KeyCompareKind kind,
+                             int &cmp, const ObDatumAccessContext *access_ctx)
+{
+  if (kind == KeyCompareKind::ORIGINAL || left.is_null() || right.is_null()
+      || left.is_ext() || right.is_ext()) {
     return cmp_func(left, right, cmp, access_ctx);
-  } else if (cmp_func == binary->null_first_cmp_ || cmp_func == binary->null_last_cmp_) {
+  } else if (kind == KeyCompareKind::BINARY_STRING) {
     const int64_t length = MIN(left.len_, right.len_);
     const int bytes = length == 0 ? 0 : MEMCMP(left.ptr_, right.ptr_, length);
     cmp = bytes != 0 ? bytes : (left.len_ < right.len_ ? -1 : left.len_ > right.len_ ? 1 : 0);
-  } else if (cmp_func == utf8->null_first_cmp_ || cmp_func == utf8->null_last_cmp_) {
+  } else if (kind == KeyCompareKind::UTF8_GENERAL_CI_STRING) {
     if (left.len_ == right.len_
         && (left.len_ == 0 || 0 == MEMCMP(left.ptr_, right.ptr_, left.len_))) {
       cmp = 0;
@@ -422,7 +435,9 @@ int ObSortOpImpl::ObAdaptiveQS::compare_vals(int64_t l, int64_t r,
 
 ObSortOpImpl::Compare::Compare()
   : ret_(OB_SUCCESS), sort_collations_(nullptr), sort_cmp_funs_(nullptr),
-    exec_ctx_(nullptr), access_ctx_(nullptr), cmp_count_(0), cmp_start_(0), cmp_end_(0)
+    exec_ctx_(nullptr), access_ctx_(nullptr), enable_encode_sortkey_(false),
+    cmp_count_(0), cmp_start_(0), cmp_end_(0), cnt_(0), collation_data_(nullptr),
+    cmp_func_data_(nullptr), key_compare_kinds_{}
 {
 }
 
@@ -446,6 +461,13 @@ int ObSortOpImpl::Compare::init(
     cmp_start_ = 0;
     cmp_end_ = sort_cmp_funs_->count();
     enable_encode_sortkey_ = enable_encode_sortkey;
+    collation_data_ = sort_collations_->get_data();
+    cmp_func_data_ = sort_cmp_funs_->get_data();
+    // The immutable plan arrays also back prefix-sort views. Initialize the
+    // cache even for encoded sort, which can fall back to row comparisons.
+    for (int64_t i = 0; i < cnt_ && i < CACHED_KEY_COUNT; ++i) {
+      key_compare_kinds_[i] = classify_sort_key(cmp_func_data_[i].cmp_func_);
+    }
   }
   return ret;
 }
@@ -482,17 +504,17 @@ bool ObSortOpImpl::Compare::operator()(
   } else {
     const ObDatum *lcells = l->cells();
     const ObDatum *rcells = r->cells();
-    // The immutable sort-key arrays are validated at init. Avoid repeating
-    // array bounds checks for every key of every pair of rows.
-    const ObSortFieldCollation *collations = sort_collations_->get_data();
-    const ObSortCmpFunc *cmp_funcs = sort_cmp_funs_->get_data();
+    const ObSortFieldCollation *collations = collation_data_;
+    const ObSortCmpFunc *cmp_funcs = cmp_func_data_;
     int cmp = 0;
     for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
       const ObSortFieldCollation& sort_collation = collations[i];
       const int64_t idx = sort_collation.field_idx_;
+      const KeyCompareKind kind = i < CACHED_KEY_COUNT
+          ? key_compare_kinds_[i] : classify_sort_key(cmp_funcs[i].cmp_func_);
       if (OB_FAIL(
               compare_repeated_sort_key(lcells[idx], rcells[idx],
-                                        cmp_funcs[i].cmp_func_, cmp, access_ctx_))) {
+                                        cmp_funcs[i].cmp_func_, kind, cmp, access_ctx_))) {
       } else if (cmp < 0) {
         less = sort_collation.is_ascending_;
       } else if (cmp > 0) {

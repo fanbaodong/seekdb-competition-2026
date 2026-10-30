@@ -531,10 +531,23 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
   } else {
     cur_idx_ = 0;
     const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
-    for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
-        };
+    const sql::ObBitVector *skip = token_iter_->get_skip();
+    if (doc_id_datum.is_batch() && skip->is_all_false(count_)) {
+      // DAS already compacts storage/MVCC-filtered rows. Check the skip vector
+      // once for this common dense batch instead of once for every posting.
+      OB_ASSERT(count_ >= 0 && count_ <= doc_id_.count());
+      ObDocIdExt *ids = doc_id_.get_data();
+      const ObDatum *datums = doc_id_datum.datums_;
+      for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
+        if (OB_FAIL(ids[i].from_datum(datums[i]))) {
+        }
+      }
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
+        if (OB_LIKELY(!skip->at(i))) {
+          if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+          }
+        }
       }
     }
   }

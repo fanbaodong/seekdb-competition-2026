@@ -165,6 +165,21 @@ int ObStringDiffDecoder::batch_decode(
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(buf = static_cast<char *>(ctx.allocator_->alloc(buf_size * row_cap)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (string_size <= min_buf_size && row_cap > 1) {
+      // Common segments are identical for the whole microblock. Assemble them
+      // once instead of interpreting the segment descriptors for every row.
+      // Initialize the differing positions too: they are overwritten below,
+      // but the template copy must not read uninitialized bytes.
+      char common_template[min_buf_size] = {};
+      header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),
+          header_->common_data(), common_template);
+      for (int64_t i = 0; i < row_cap; ++i) {
+        if (16 == string_size) {
+          MEMCPY(buf + i * buf_size, common_template, 16);
+        } else {
+          MEMCPY(buf + i * buf_size, common_template, string_size);
+        }
+      }
     } else {
       for (int64_t i = 0; i < row_cap; ++i) {
         header_->copy_string(ObStringDiffHeader::LeftToRight(), std::logical_not<uint8_t>(),

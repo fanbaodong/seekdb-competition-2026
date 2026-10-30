@@ -221,6 +221,11 @@ int ObTextDaaTIter::get_presence_union_rows(const int64_t capacity, int64_t &cou
       }
     } else {
       PresenceIdBatch &batch = presence_batches_[equal_heads[0]];
+      // The head was already checked against every other active dimension;
+      // with a unique minimum it is strictly before second. Consume it once
+      // here instead of repeating the same comparison at the start of the run.
+      cache_id(*minimum);
+      ++batch.pos_;
       // Drain a disjoint sorted run without repeating all head comparisons.
       // Stop before the second head so overlaps are deduplicated above. Neither
       // buffer can refill within this loop, including when an output batch ends.

@@ -27,7 +27,7 @@ namespace storage
 
 // Encoded document IDs use the binary collation: compare all bytes, including
 // trailing spaces. No character-set lookup or Unicode decoding is required.
-inline int compare_binary_retrieval_id(const ObDatum &lhs, const ObDatum &rhs,
+OB_INLINE int compare_binary_retrieval_id(const ObDatum &lhs, const ObDatum &rhs,
                                       int &cmp_ret, const common::ObDatumAccessContext *ctx)
 {
   if (OB_UNLIKELY(lhs.is_ext() || rhs.is_ext())) {
@@ -41,6 +41,10 @@ inline int compare_binary_retrieval_id(const ObDatum &lhs, const ObDatum &rhs,
     // A constant-size comparison lets the compiler use unaligned word loads
     // for common fixed-width IDs, preserving unsigned byte order.
     cmp_ret = MEMCMP(lhs.ptr_, rhs.ptr_, sizeof(uint64_t));
+  } else if (lhs.len_ == 2 * sizeof(uint64_t) && rhs.len_ == 2 * sizeof(uint64_t)) {
+    // Generated IDs also use two words. A fixed-size byte comparison avoids
+    // the variable-length libc path without assuming alignment or word order.
+    cmp_ret = MEMCMP(lhs.ptr_, rhs.ptr_, 2 * sizeof(uint64_t));
   } else {
     const int64_t length = MIN(lhs.len_, rhs.len_);
     const int cmp = length == 0 ? 0 : MEMCMP(lhs.ptr_, rhs.ptr_, length);
