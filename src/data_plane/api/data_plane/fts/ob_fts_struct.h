@@ -60,7 +60,14 @@ private:
 // TOKENIZE, fulltext row generation and query tokenization construct this map
 // on their stack and consume it synchronously. Shared dictionaries use separate
 // containers; taking a latch for every document-local token is unnecessary.
-typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
+using FTWordNode = common::hash::HashMapTypes<ObFTWord, int64_t>::AllocType;
+using FTWordNodeAllocator = common::hash::SimpleAllocer<FTWordNode,
+    common::hash::NodeNumTraits<FTWordNode>::NODE_NUM, common::hash::NoPthreadDefendMode>;
+// The node pool belongs to the same local map. Its allocation/free operations
+// need no spinlock either; bucket order and collation-aware keys stay unchanged.
+typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode,
+    common::hash::hash_func<ObFTWord>, common::hash::equal_to<ObFTWord>,
+    FTWordNodeAllocator> ObFTWordMap;
 
 class ObAddWordFlag final
 {

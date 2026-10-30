@@ -127,7 +127,16 @@ int ObSRBMWIterImpl::top_k_search()
   int64_t eval_pivot_cnt = 0;
   int64_t eval_pivot_range_cnt = 0;
   int64_t skip_range_cnt = 0;
+  int64_t previous_skip_range_cnt = 0;
 
+  bool unit_weights = nullptr == iter_param_->dim_weights_;
+  if (!unit_weights && iter_param_->field_boost_ == 1.0
+      && iter_param_->dim_weights_->count() == dim_iters_->count()) {
+    unit_weights = true;
+    for (int64_t i = 0; unit_weights && i < dim_iters_->count(); ++i) {
+      unit_weights = iter_param_->dim_weights_->at(i) == 1.0;
+    }
+  }
   int64_t pivot_iter_idx = 0;
   while (OB_SUCC(ret) && BMWStatus::FINISHED != status_) {
     switch (status_) {
@@ -164,6 +173,32 @@ int ObSRBMWIterImpl::top_k_search()
         }
       } else {
         status_ = BMWStatus::FIND_NEXT_PIVOT;
+        // If a short unweighted query has not pruned any range, repeated
+        // shallow seeks cost more than a bounded sequential merge. Keep the
+        // same merger, relevance collector and top-k heap; periodically return
+        // to BMW so later selective ranges can still be skipped.
+        if (dim_iters_->count() <= 8 && unit_weights
+            && 0 == eval_pivot_cnt % 64) {
+          bool sequential_ready = skip_range_cnt == previous_skip_range_cnt;
+          previous_skip_range_cnt = skip_range_cnt;
+          // Other dimensions can retain shallow positions after an earlier
+          // pruned range. Never consume their upper bounds as actual scores.
+          for (int64_t i = 0; sequential_ready && i < dim_iters_->count(); ++i) {
+            sequential_ready = !get_iter(i)->in_shallow_status();
+          }
+          for (int64_t i = 0; sequential_ready && OB_SUCC(ret) && i < 256; ++i) {
+            const ObDatum *id = nullptr;
+            double score = 0.0;
+            bool valid = false;
+            if (OB_FAIL(collect_dims_by_id(id, score, valid))) {
+            } else if (OB_FAIL(fill_merge_heap())) {
+            }
+          }
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+            status_ = BMWStatus::FINISHED;
+          }
+        }
       }
       break;
     }

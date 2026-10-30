@@ -28,6 +28,34 @@ using namespace common;
 namespace sql
 {
 
+namespace
+{
+// Repeated fulltext words are often byte-identical. Avoid decoding the same
+// UTF-8 word on every sort comparison. Match the comparator function itself,
+// so LOB locators, other data types and other collations retain their behavior.
+int compare_repeated_sort_key(const ObDatum &left, const ObDatum &right,
+                             const ObDatumCmpFuncType cmp_func, int &cmp,
+                             const ObDatumAccessContext *access_ctx)
+{
+  static const ObDatumBasicFuncs *binary = ObDatumFuncs::get_basic_func(ObVarcharType, CS_TYPE_BINARY);
+  static const ObDatumBasicFuncs *utf8 = ObDatumFuncs::get_basic_func(ObVarcharType, CS_TYPE_UTF8MB4_GENERAL_CI);
+  if (left.is_null() || right.is_null() || left.is_ext() || right.is_ext()) {
+    return cmp_func(left, right, cmp, access_ctx);
+  } else if (cmp_func == binary->null_first_cmp_ || cmp_func == binary->null_last_cmp_) {
+    const int64_t length = MIN(left.len_, right.len_);
+    const int bytes = length == 0 ? 0 : MEMCMP(left.ptr_, right.ptr_, length);
+    cmp = bytes != 0 ? bytes : (left.len_ < right.len_ ? -1 : left.len_ > right.len_ ? 1 : 0);
+  } else if ((cmp_func == utf8->null_first_cmp_ || cmp_func == utf8->null_last_cmp_)
+             && left.len_ == right.len_
+             && (left.len_ == 0 || 0 == MEMCMP(left.ptr_, right.ptr_, left.len_))) {
+    cmp = 0;
+  } else {
+    return cmp_func(left, right, cmp, access_ctx);
+  }
+  return OB_SUCCESS;
+}
+} // namespace
+
 /************************************* start ObSortOpImpl *********************************/
 ObSortOpImpl::ObAdaptiveQS::ObAdaptiveQS(common::ObIArray<ObChunkDatumStore::StoredRow *> &sort_rows,
                                          common::ObIAllocator &alloc)
@@ -421,7 +449,8 @@ bool ObSortOpImpl::Compare::operator()(
       const ObSortFieldCollation& sort_collation = sort_collations_->at(i);
       const int64_t idx = sort_collation.field_idx_;
       if (OB_FAIL(
-              sort_cmp_funs_->at(i).cmp_func_(lcells[idx], rcells[idx], cmp, access_ctx_))) {
+              compare_repeated_sort_key(lcells[idx], rcells[idx],
+                                        sort_cmp_funs_->at(i).cmp_func_, cmp, access_ctx_))) {
       } else if (cmp < 0) {
         less = sort_collation.is_ascending_;
       } else if (cmp > 0) {

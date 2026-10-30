@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_text_retrieval_token_iter.h"
+#include "ob_sparse_retrieval_util.h"
 #include "query/das/ob_das_iter_access.h"
 #include "share/rc/ob_server_runtime.h"
 #include "query/engine/expr/ob_expr_bm25.h"
@@ -440,7 +441,7 @@ int ObTextRetrievalDaaTTokenIter::init(const ObTextRetrievalScanIterParam &iter_
       inv_scan_domain_id_col_ = iter_param.inv_scan_domain_id_col_;
       max_batch_size_ = OB_MAX(iter_param.eval_ctx_->max_batch_size_, 1);
       common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(inv_scan_domain_id_col_->datum_meta_.type_, CS_TYPE_BINARY);
-      cmp_func_ = basic_funcs->null_first_cmp_;
+      cmp_func_ = retrieval_id_cmp(basic_funcs);
       if (OB_ISNULL(cmp_func_)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (FALSE_IT(relevance_.set_allocator(allocator_))) {

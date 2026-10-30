@@ -1,10 +1,10 @@
 drop table if exists fts_predicate_only;
 create table fts_predicate_only(id int primary key, content text,
-  fulltext index ft(content) with parser beng);
+fulltext index ft(content) with parser beng);
 insert into fts_predicate_only values
-  (1,'alpha beta gamma'),(2,'alpha alpha delta'),(3,'beta epsilon'),
-  (4,'gamma delta'),(5,null),(6,''),(7,'the and a'),(8,'ALPHA beta'),
-  (9,'omega theta'),(10,'delta epsilon');
+(1,'alpha beta gamma'),(2,'alpha alpha delta'),(3,'beta epsilon'),
+(4,'gamma delta'),(5,null),(6,''),(7,'the and a'),(8,'ALPHA beta'),
+(9,'omega theta'),(10,'delta epsilon');
 select id from fts_predicate_only where match(content) against('alpha beta') order by id;
 id
 1
@@ -15,21 +15,21 @@ select count(*) as hits from fts_predicate_only where match(content) against('al
 hits
 4
 select /*+ opt_param('ROWSETS_MAX_ROWS', 0) */ id from fts_predicate_only
-  where match(content) against('alpha beta') order by id;
+where match(content) against('alpha beta') order by id;
 id
 1
 2
 3
 8
 select /*+ opt_param('ROWSETS_MAX_ROWS', 1) */ id from fts_predicate_only
-  where match(content) against('alpha beta') order by id;
+where match(content) against('alpha beta') order by id;
 id
 1
 2
 3
 8
 select /*+ opt_param('ROWSETS_MAX_ROWS', 32) */ id from fts_predicate_only
-  where match(content) against('alpha beta') order by id;
+where match(content) against('alpha beta') order by id;
 id
 1
 2
@@ -56,18 +56,18 @@ id
 2
 3
 select count(*) as limited_hits from
-  (select id from fts_predicate_only where match(content) against('alpha beta') limit 2) t;
+(select id from fts_predicate_only where match(content) against('alpha beta') limit 2) t;
 limited_hits
 2
 select id, round(match(content) against('alpha beta'), 6) as score
-  from fts_predicate_only where match(content) against('alpha beta') order by id;
+from fts_predicate_only where match(content) against('alpha beta') order by id;
 id	score
 1	2.135934
 2	1.304831
 3	1.132911
 8	2.265822
 select id from fts_predicate_only where match(content) against('alpha beta')
-  order by match(content) against('alpha beta') desc, id limit 3;
+order by match(content) against('alpha beta') desc, id limit 3;
 id
 8
 1
@@ -92,7 +92,7 @@ id
 1
 8
 select id from fts_predicate_only where match(content) against('alpha beta')
-  or match(content) against('gamma delta') > 0.5 order by id;
+or match(content) against('gamma delta') > 0.5 order by id;
 id
 1
 2
@@ -101,7 +101,7 @@ id
 8
 10
 select id from fts_predicate_only force index(primary)
-  where id > 1 and match(content) against('alpha beta') order by id;
+where id > 1 and match(content) against('alpha beta') order by id;
 id
 2
 3

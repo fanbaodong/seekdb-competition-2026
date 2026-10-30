@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_sparse_daat_iter.h"
+#include "ob_sparse_retrieval_util.h"
 
 namespace oceanbase
 {
@@ -40,7 +41,7 @@ int ObSRMergeCmp::init(
   } else {
     iter_ids_ = iter_ids;
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
-    cmp_func_ = basic_funcs->null_first_cmp_;
+    cmp_func_ = retrieval_id_cmp(basic_funcs);
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {

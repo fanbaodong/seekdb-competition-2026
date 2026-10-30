@@ -227,13 +227,12 @@ int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
   } else {
-    // Avoid a second hash-table lookup and key replacement for repeated words.
-    // Keep the existing first-occurrence count (1), preserving index semantics.
-    int64_t *word_count = word_map_.get(word);
-    if (nullptr != word_count) {
-      *word_count += word_freq;
-    } else if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
-    }
+    // Probe once for both new and repeated words. Preserve the first count (1)
+    // and the stored key so iteration order and token ownership stay unchanged.
+    auto add_frequency = [word_freq](hash::HashMapPair<ObFTWord, int64_t> &entry) {
+      entry.second += word_freq;
+    };
+    ret = word_map_.set_or_update(word, 1/*word count*/, add_frequency);
   }
   return ret;
 }
