@@ -21,6 +21,10 @@ def main():
     lock = threading.Lock()
     servers = []
     threads = []
+    constant_prompt = "literal {0}, quote ', backslash \\ and 中文"
+    block_constant_request = threading.Event()
+    constant_request_started = threading.Event()
+    release_constant_request = threading.Event()
 
     def handler(name):
         class Handler(BaseHTTPRequestHandler):
@@ -33,6 +37,10 @@ def main():
                 with lock:
                     calls[(name, prompt)] += 1
                     attempt = calls[(name, prompt)]
+                if prompt == constant_prompt and block_constant_request.is_set():
+                    constant_request_started.set()
+                    if not release_constant_request.wait(15):
+                        raise TimeoutError('constant request was not released by the test')
                 time.sleep(0.12)
                 if name == 'b' and attempt == 1:
                     status, response = 400, {'error': {'message': 'transient test failure'}}
@@ -113,6 +121,51 @@ def main():
         assert calls[('a', 'rolled-back')] == 0 and calls[('b', 'rolled-back')] == 0
         print('PASS: rolled-back writes do not call models', flush=True)
 
+        cur.execute('''CREATE TABLE ai_column_extra_regression.constant_prompts(
+            id BIGINT PRIMARY KEY,
+            answer VARCHAR(400) AI COLUMN (AI_COMPLETE('ai_extra_a',%s))
+                WITH(sync_mode='async',max_retries=1))''', (constant_prompt,))
+        cur.execute('INSERT INTO ai_column_extra_regression.constant_prompts(id) VALUES(1)')
+        deadline = time.monotonic() + 20
+        while True:
+            cur.execute('SELECT answer FROM ai_column_extra_regression.constant_prompts WHERE id=1')
+            answer = cur.fetchone()[0]
+            if answer is not None:
+                assert answer == 'a:' + constant_prompt, answer
+                break
+            assert time.monotonic() < deadline, 'constant prompt did not finish'
+            time.sleep(0.1)
+        assert calls[('a', constant_prompt)] == 1, dict(calls)
+        # While the first model request is blocked, delete both rows. Any
+        # already-picked sibling must be dropped after checking row existence,
+        # and the first response cannot publish into either deleted row.
+        block_constant_request.set()
+        cur.execute('INSERT INTO ai_column_extra_regression.constant_prompts(id) VALUES(2),(3)')
+        try:
+            assert constant_request_started.wait(10), 'constant request did not reach mock'
+            cur.execute('DELETE FROM ai_column_extra_regression.constant_prompts WHERE id IN (2,3)')
+        finally:
+            release_constant_request.set()
+        # A new task is a completion barrier for the single worker: observing
+        # its result proves the earlier in-flight response has been handled.
+        cur.execute('INSERT INTO ai_column_extra_regression.constant_prompts(id) VALUES(4)')
+        deadline = time.monotonic() + 20
+        while True:
+            cur.execute('SELECT answer FROM ai_column_extra_regression.constant_prompts WHERE id=4')
+            answer = cur.fetchone()[0]
+            with lock:
+                request_count = calls[('a', constant_prompt)]
+            assert request_count <= 3, ('deleted row caused a model request', dict(calls))
+            if answer is not None:
+                assert answer == 'a:' + constant_prompt, answer
+                break
+            assert time.monotonic() < deadline, 'constant worker barrier did not finish'
+            time.sleep(0.1)
+        assert calls[('a', constant_prompt)] == 3, dict(calls)
+        cur.execute('SELECT id,answer FROM ai_column_extra_regression.constant_prompts ORDER BY id')
+        assert cur.fetchall() == ((1, 'a:' + constant_prompt), (4, 'a:' + constant_prompt))
+        print('PASS: literal constant prompt, stale deleted task and late response', flush=True)
+
         cur.execute('''CREATE TABLE ai_column_extra_regression.bad_types(
             id BIGINT PRIMARY KEY, content VARCHAR(100),
             score BIGINT AI COLUMN (AI_COMPLETE('ai_extra_a',content))
@@ -133,6 +186,7 @@ def main():
         assert calls[('a', 'invalid-number')] == 2, dict(calls)
         print('PASS: invalid typed output exhausts bounded retries and stays NULL', flush=True)
     finally:
+        release_constant_request.set()
         cur.execute('DROP DATABASE IF EXISTS ai_column_extra_regression')
         for name in ('a', 'b'):
             for method, obj in [('DROP_AI_MODEL_ENDPOINT', 'ai_extra_' + name + '_ep'),

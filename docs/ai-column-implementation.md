@@ -59,5 +59,35 @@ generation, invalidates the result, and inserts the new task through a dedicated
 transactional inner session.
 
 Full logs and the final submission fields are retained in the task folder.
-These are local test results; the competition platform has not evaluated this
-new branch yet.
+
+## Follow-up on platform execution failure (2026-10-30)
+
+The platform reported an execution failure for `503c36b2293ac1f3682ed29243ab96f7a4017ea7`
+without build or runtime diagnostics. Anonymous remote lookup confirmed the
+submitted branch and commit. A fresh database started successfully and passed
+all five original AI-column mysqltests. Clean CMake configuration with parser
+caching disabled produced the same parser and inner-table sources as the
+previous build. These checks did not reproduce the platform failure.
+
+The audit found and repaired two independent defects:
+
+- The new Share headers were listed in the public inventory but had no Bazel
+  semantic owner. The package's ownership validator rejected the submitted
+  revision. `ai_column_interface` now owns both headers; Observer and the actual
+  SQL consumers declare the dependency. The original validator passes after
+  the repair. A complete Bazel build was not run.
+- Constant AI prompts caused the worker to issue an empty SQL query. The worker
+  now checks that the business row still exists using `SELECT 1` before sending
+  the constant prompt. Literal braces are preserved. The added runtime
+  regression fails against the previous binary with a completion timeout and
+  covers row deletion while a model response is in flight.
+
+The platform's build path is unknown, so the Bazel error is not confirmed as the
+cause of the reported execution failure. Local checks do not imply a platform
+score or guarantee that submission infrastructure will succeed.
+
+The repaired source compiled and linked successfully with Linux Clang 17. On a
+new empty database, all five original AI-column mysqltests, the added runtime
+regressions (including the constant-prompt case), AI-function enhancement, and
+File SQL checks passed. The original competition test inputs and expected
+results were not changed. The local service was stopped after verification.

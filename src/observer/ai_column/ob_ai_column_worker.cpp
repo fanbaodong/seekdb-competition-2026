@@ -332,15 +332,19 @@ static int eval_task_prompt(ObAiWorkerTableInfo &info, const ObAiColumnMeta &met
   ObTimeoutCtx timeout_ctx;
   row_exists = false;
   if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, WORKER_SQL_TIMEOUT_US))) {
-  } else if (meta.expr_.arg_columns_.empty()) {
-    user_text = meta.expr_.user_template_;
-    row_exists = true;
   } else if (OB_FAIL(sql.assign_fmt("SELECT "))) {
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < meta.expr_.arg_columns_.count(); ++i) {
-      if (OB_FAIL(sql.append_fmt("%s`%.*s` AS c%ld", i == 0 ? "" : ",",
-                                 static_cast<int>(meta.expr_.arg_columns_.at(i).length()),
-                                 meta.expr_.arg_columns_.at(i).ptr(), i))) {
+    if (meta.expr_.arg_columns_.empty()) {
+      // A constant prompt still needs a live business row. Do not send a
+      // request for a row deleted after the task was picked up.
+      if (OB_FAIL(sql.append("1"))) {
+      }
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < meta.expr_.arg_columns_.count(); ++i) {
+        if (OB_FAIL(sql.append_fmt("%s`%.*s` AS c%ld", i == 0 ? "" : ",",
+                                   static_cast<int>(meta.expr_.arg_columns_.at(i).length()),
+                                   meta.expr_.arg_columns_.at(i).ptr(), i))) {
+        }
       }
     }
     if (OB_SUCC(ret)) {
@@ -363,6 +367,10 @@ static int eval_task_prompt(ObAiWorkerTableInfo &info, const ObAiColumnMeta &met
         row_exists = false;
         ret = OB_SUCCESS;
       } else if (OB_FAIL(ret)) {
+      } else if (meta.expr_.arg_columns_.empty()) {
+        row_exists = true;
+        // Literal braces in a constant prompt are not dependency placeholders.
+        user_text = meta.expr_.user_template_;
       } else {
         row_exists = true;
         ObStringBuffer buf(&(info.allocator_));
