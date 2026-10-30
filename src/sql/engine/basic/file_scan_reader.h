@@ -24,6 +24,7 @@ struct FileColumn {
   std::string name;
   FileColumnType type = FileColumnType::NIL;
   int64_t non_null_count = 0;
+  int16_t scale = 0;
 };
 struct FileReadOptions {
   bool header = true;

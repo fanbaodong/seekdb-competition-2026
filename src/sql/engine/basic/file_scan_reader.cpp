@@ -713,7 +713,11 @@ bool FileScanReader::infer()
       }
       if (row.size() != columns_.size()) return fail("CSV field count differs from schema");
       for (size_t i = 0; i < row.size(); ++i) if (!row[i].is_null) {
-        columns_[i].type = widen(columns_[i].type, infer_type(row[i].text));
+        const FileColumnType value_type = infer_type(row[i].text);
+        columns_[i].type = widen(columns_[i].type, value_type);
+        if (value_type == FileColumnType::DATETIME && row[i].text.size() > 20) {
+          columns_[i].scale = std::max(columns_[i].scale, static_cast<int16_t>(row[i].text.size() - 20));
+        }
         ++columns_[i].non_null_count;
       }
     } else {
@@ -725,7 +729,14 @@ bool FileScanReader::infer()
           columns_.push_back({names[i], FileColumnType::NIL, 0});
         }
         FileColumn &column = columns_[name_to_index[key]];
-        if (!row[i].is_null) { column.type = widen(column.type, infer_type(row[i].text)); ++column.non_null_count; }
+        if (!row[i].is_null) {
+          const FileColumnType value_type = infer_type(row[i].text);
+          column.type = widen(column.type, value_type);
+          if (value_type == FileColumnType::DATETIME && row[i].text.size() > 20) {
+            column.scale = std::max(column.scale, static_cast<int16_t>(row[i].text.size() - 20));
+          }
+          ++column.non_null_count;
+        }
       }
     }
     ++row_count_;

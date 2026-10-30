@@ -32,15 +32,19 @@ enum ParquetType {
 
 struct TVal {
   int type = 0;
+  int field_id = 0;
   int64_t i = 0;
   double d = 0;
   std::string s;
   std::vector<TVal> list;
-  std::vector<std::pair<int, TVal>> fields;
+  // vector supports an incomplete element type; pair<int, TVal> may instantiate
+  // TVal's destructor before the pair is complete with Clang/libstdc++ in C++20.
+  // Keep the Thrift field ID on the child so both recursive containers are TVal.
+  std::vector<TVal> fields;
 
   const TVal *field(int id) const
   {
-    for (const auto &item : fields) if (item.first == id) return &item.second;
+    for (const auto &item : fields) if (item.field_id == id) return &item;
     return nullptr;
   }
   int64_t get_int(int id, int64_t fallback = 0) const
@@ -183,7 +187,8 @@ bool Compact::value(int type, TVal &out, unsigned depth)
         last = id;
         TVal item;
         if (!value(kind, item, depth + 1)) return false;
-        out.fields.emplace_back(static_cast<int>(id), std::move(item));
+        item.field_id = static_cast<int>(id);
+        out.fields.push_back(std::move(item));
       }
     }
     default:
@@ -334,7 +339,7 @@ bool decode_plain(const uint8_t *data, size_t size, int type, int64_t count,
                   int64_t fixed_length, std::vector<std::string> &out, std::string &error)
 {
   out.clear();
-  if (count < 0 || count > MAX_PAGE_VALUES) { error = "invalid parquet value count"; return false; }
+  if (count < 0 || count > static_cast<int64_t>(MAX_PAGE_VALUES)) { error = "invalid parquet value count"; return false; }
   out.reserve(static_cast<size_t>(count));
   size_t pos = 0;
   for (int64_t i = 0; i < count; ++i) {
@@ -495,8 +500,8 @@ bool load_page(FILE *file, ColumnCursor &cursor, std::string &error)
     const int64_t compressed = header.get_int(3, -1);
     const int64_t uncompressed_size = header.get_int(2, -1);
     const int64_t page_type = header.get_int(1, -1);
-    if (compressed < 0 || compressed > MAX_PAGE_BYTES || uncompressed_size < 0
-        || uncompressed_size > MAX_PAGE_BYTES || static_cast<uint64_t>(compressed) > cursor.end - body_start) {
+    if (compressed < 0 || compressed > static_cast<int64_t>(MAX_PAGE_BYTES) || uncompressed_size < 0
+        || uncompressed_size > static_cast<int64_t>(MAX_PAGE_BYTES) || static_cast<uint64_t>(compressed) > cursor.end - body_start) {
       error = "invalid or oversized parquet page";
       return false;
     }
@@ -577,7 +582,7 @@ bool load_page(FILE *file, ColumnCursor &cursor, std::string &error)
           payload_size = values_size;
         }
       }
-      if (count <= 0 || count > cursor.remaining || count > MAX_PAGE_VALUES
+      if (count <= 0 || count > cursor.remaining || count > static_cast<int64_t>(MAX_PAGE_VALUES)
           || def_length < 0 || rep_length != 0) {
         error = "invalid parquet page counts or repetition levels";
         return false;
@@ -723,7 +728,7 @@ bool ParquetReader::open(FILE *file, std::vector<FileColumn> &columns, std::stri
   const TVal *schema = p.metadata.field(2), *groups = p.metadata.field(4);
   if (!schema || !groups || schema->list.size() < 2
       || schema->list.size() > FileScanReader::MAX_COLUMNS + 1
-      || schema->list[0].get_int(5, -1) != schema->list.size() - 1) {
+      || schema->list[0].get_int(5, -1) != static_cast<int64_t>(schema->list.size() - 1)) {
     error = "invalid or nested parquet schema"; return false;
   }
   columns.clear();

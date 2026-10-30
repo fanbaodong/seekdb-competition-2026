@@ -5,6 +5,7 @@ Requires pymysql and pyarrow (fixture generator only). Creates a unique child
 directory and removes only that directory at the end.
 """
 import argparse
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import uuid
@@ -43,6 +44,20 @@ with tempfile.TemporaryDirectory(prefix='seekdb_sql_', dir=parent) as tmp:
     assert query('select @@session.enable_file_sql') == ((0,),)
     error(f"copy (select 1) to '{path('off.csv')}'", 1235)
     query('set session enable_file_sql=ON')
+    (root / 'seconds.csv').write_text('t\n2026-08-01T10:11:12\n', encoding='utf-8')
+    assert query(f"select t from read_csv('{path('seconds.csv')}')") == ((datetime(2026,8,1,10,11,12),),)
+    assert cur.description[0][5] == 0, cur.description
+    (root / 'fractional.csv').write_text(
+        'id,t\n1,2026-08-01 10:11:12\n2,2026-08-01T10:11:12.1234\n3,2026-08-01 10:11:12.001234\n', encoding='utf-8')
+    assert query(f"select t from read_csv('{path('fractional.csv')}') order by id") == (
+        (datetime(2026,8,1,10,11,12),), (datetime(2026,8,1,10,11,12,123400),),
+        (datetime(2026,8,1,10,11,12,1234),))
+    assert cur.description[0][5] == 6, cur.description
+    (root / 'fractional.jsonl').write_text(
+        '{"id":1,"t":"2026-08-01"}\n{"id":2,"t":"2026-08-01T10:11:12.1234"}\n{"id":3}\n', encoding='utf-8')
+    assert query(f"select t from read_json('{path('fractional.jsonl')}') order by id") == (
+        (datetime(2026,8,1),), (datetime(2026,8,1,10,11,12,123400),), (None,))
+    assert cur.description[0][5] == 4, cur.description
     assert query(f"select id,n from read_parquet('{path('data.parquet')}') order by id") == ((1,5),(2,None),(3,7))
     assert query(f"select c.id,j.label from read_csv('{path('data.csv')}') c left join read_json('{path('data.jsonl')}') j on c.id=j.id order by c.id") == ((1,'one'),(2,None),(3,'three'))
     assert query(f"select count(*) from read_csv('{path('data.csv')}') c join read_parquet('{path('data.parquet')}') p on c.id=p.id") == ((3,),)
@@ -75,5 +90,5 @@ with tempfile.TemporaryDirectory(prefix='seekdb_sql_', dir=parent) as tmp:
     error(f"copy (select (select id from read_csv('{path('data.csv')}'))) to '{path('failed.csv')}'")
     assert not (root/'failed.csv').exists()
     assert not list(root.glob('*.seekdb-copy-*.tmp'))
-    print('PASS native CSV/JSONL/Parquet, JOIN, DESCRIBE, EXPLAIN, COPY options/empty/table/rollback/no-overwrite')
+    print('PASS native CSV/JSONL/Parquet, DATETIME precision, JOIN, DESCRIBE, EXPLAIN, COPY options/empty/table/rollback/no-overwrite')
 db.close()

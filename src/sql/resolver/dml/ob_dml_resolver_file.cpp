@@ -142,6 +142,11 @@ int ObDMLResolver::resolve_file_table_item(const ParseNode &node, TableItem *&ta
       default: type.set_type(ObVarcharType); break;
     }
     type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY2[0][type.get_type()]);
+    if (column.type == FileColumnType::DATETIME) {
+      // Preserve the inferred precision in the MySQL result metadata. The DDL
+      // default is six, which adds fractional zeros even to second-only files.
+      type.set_scale(column.scale);
+    }
     if (type.is_string_type()) {
       type.set_length(FileScanReader::MAX_FIELD_BYTES);
       type.set_collation_type(CS_TYPE_UTF8MB4_BIN);
