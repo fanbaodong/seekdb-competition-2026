@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "share/ai_column/ob_ai_column_util.h"
 #include <set>
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "lib/utility/ob_smart_call.h"
@@ -760,6 +761,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
     }  // end switch
+    if (OB_SUCC(ret) && OB_NOT_NULL(stmt) && stmt->is_dml_stmt()) {
+      if (OB_FAIL(share::ObAiColumnUtil::check_strict_read(*params_.session_info_,
+          *static_cast<ObDMLStmt *>(stmt)))) {
+      }
+    }
     if (OB_SUCC(ret) && stmt->is_dml_write_stmt()) {
       // todo yanli:check leader-follower database
     }

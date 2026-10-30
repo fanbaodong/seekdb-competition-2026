@@ -686,6 +686,7 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"return", RETURN},
   {"returns", RETURNS},
   {"reverse", REVERSE},
+  {"retry", RETRY},
   {"rewrite", REWRITE},
   {"revoke", REVOKE},
   {"right", RIGHT},
