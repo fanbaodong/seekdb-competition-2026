@@ -91,3 +91,62 @@ new empty database, all five original AI-column mysqltests, the added runtime
 regressions (including the constant-prompt case), AI-function enhancement, and
 File SQL checks passed. The original competition test inputs and expected
 results were not changed. The local service was stopped after verification.
+
+## Queue isolation after recycled-table cleanup (2026-10-30)
+
+The platform also rejected `f51e2fd47f54fc61789041c555385b3e44c206e8`
+without diagnostics. Its anonymous remote reference was correct. All 9,197
+tracked files were compared with the Linux source cache: the only differences
+were an older documentation file and one extra trailing newline in three
+headers. Actual compile flags matched the independent clean configuration.
+Clean configuration of the exact f51 source, with parser caching disabled,
+also succeeded. This is not an uncached full-project compilation claim.
+
+A runtime defect was reproduced after using the repository CI initialization
+(`init.sql` and `init_user.sql`, including `recyclebin=on`) and the `admin/test`
+test identity. The five original AI-column tests passed, but their final
+RETRY/DROP sequence left a task whose table had moved to the recyclebin and
+whose endpoint had been removed. The next healthy request group never ran.
+The separate `--case recyclebin-orphan` regression also fails on the f51
+binary with the old tasks still present and the healthy result still NULL.
+
+The worker now treats a successfully resolved absent or recycled table as
+obsolete. Schema, allocation, and metadata read errors retain durable tasks;
+metadata row-iteration errors are propagated instead of turning a partial
+result into evidence of a dropped column. A dropped column only invalidates
+its own task, preserving other columns in the group.
+
+Errors are scoped to one request group. Endpoint resolution occurs for each
+nonterminal task and follows bounded retry handling; cached successful and
+terminal failed tasks can be published without an endpoint lookup. A missing
+endpoint therefore cannot prevent unrelated groups or stale-task cleanup from
+making progress. The worker also checks its stop flag between work items and
+before new HTTP/write batches, and cannot be restarted during server shutdown.
+
+Focused local-only regressions can be run against a disposable instance:
+
+```bash
+python unittest/sql/engine/basic/test_ai_column_runtime.py --port PORT --case recyclebin-orphan
+python unittest/sql/engine/basic/test_ai_column_runtime.py --port PORT --case missing-endpoint
+```
+
+They hold the first HTTP response while another task is pending, remove the
+table or endpoint, then check bounded cleanup and independent healthy work.
+Observed task states are recorded as diagnostics. NULL plus strict-read
+rejection is not presented as proof of a separate hidden FAILED state.
+The competition SQL test inputs and expected results remain unchanged.
+
+Validation completed with Linux Clang 17 and `make -j2` including the default
+`observer` target. Both focused lifecycle cases fail on the retained f51
+binary and pass on the repaired binary. The missing-endpoint case observes
+task states `(1,0)`, `(3,1)`, and `(4,1)` before cleanup; its unrelated healthy
+request completes with exactly one model call. A new database using CI
+initialization passed all five unchanged AI-column mysqltests, all existing
+and added runtime regressions, AI-function enhancement, and File SQL checks.
+File SQL fixture preparation remains local; SQL and expected results are
+unchanged. The final runtime binary SHA256 is
+`841fa712348b35333543c7e5d7953af1bddc11aaebf19f88550c1ec1d3805db0`.
+
+This demonstrates a real cross-test queue-stall defect. Without the competition
+runner logs, it does not uniquely establish the platform execution-failure
+cause or guarantee the next platform score.

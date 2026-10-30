@@ -197,8 +197,10 @@ int ObAiColumnUtil::select_metas_by_table(uint64_t table_id, ObIAllocator &alloc
           } else if (OB_FAIL(metas.push_back(meta))) {
           }
         }
-        if (OB_ITER_END == tmp_ret) {
-          ret = OB_SUCCESS;
+        if (OB_SUCC(ret) && OB_ITER_END != tmp_ret) {
+          // A partial metadata result is not evidence that a column was
+          // dropped. Preserve iteration errors so the worker keeps its tasks.
+          ret = tmp_ret;
         }
       }
     }

@@ -260,7 +260,11 @@ int ObAiColumnWorker::ensure_started()
 {
   int ret = OB_SUCCESS;
   lib::ObMutexGuard guard(lifecycle_mutex_);
-  if (ATOMIC_LOAD(&is_started_)) {
+  if (OBSERVER.is_stopped()) {
+    // A DDL request already in flight may reach here after destroy() released
+    // the lifecycle lock. Do not restart the timer during server shutdown.
+    ret = OB_CANCELED;
+  } else if (ATOMIC_LOAD(&is_started_)) {
     // already running
   } else if (OB_FAIL(timer_.init("AiColWorker", ObMemAttr("AiColWorker")))) {
     LOG_WARN("fail to init ai column worker timer", K(ret));
@@ -296,24 +300,31 @@ void ObAiColumnWorker::runTimerTask()
   }
 }
 
-static int load_table_info(uint64_t table_id, ObAiWorkerTableInfo &info)
+static int load_table_info(uint64_t table_id, ObAiWorkerTableInfo &info, bool &table_gone)
 {
   int ret = OB_SUCCESS;
   schema::ObSchemaGetterGuard guard;
   const schema::ObTableSchema *table_schema = nullptr;
   const schema::ObDatabaseSchema *db_schema = nullptr;
+  table_gone = false;
   info.table_id_ = table_id;
   if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard))) {
     LOG_WARN("fail to get schema guard", K(ret));
-  } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema)) || OB_ISNULL(table_schema)) {
-    ret = OB_TABLE_NOT_EXIST;
-    LOG_WARN("ai column business table not found", K(ret), K(table_id));
+  } else if (OB_FAIL(guard.get_table_schema(table_id, table_schema))) {
+    LOG_WARN("fail to get ai column business table schema", K(ret), K(table_id));
+  } else if (OB_ISNULL(table_schema) || table_schema->is_in_recyclebin()) {
+    // A successful lookup establishes that these tasks have no live table.
+    // Transient schema/SQL errors must not be converted into task deletion.
+    table_gone = true;
   } else if (OB_FAIL(ob_write_string(info.allocator_, table_schema->get_table_name(),
                                      info.table_name_))) {
-  } else if (OB_FAIL(guard.get_database_schema(table_schema->get_database_id(), db_schema))
-             || OB_ISNULL(db_schema)) {
+  } else if (OB_FAIL(guard.get_database_schema(table_schema->get_database_id(), db_schema))) {
+    LOG_WARN("fail to get ai column business database schema", K(ret), K(table_id));
+  } else if (OB_ISNULL(db_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ai column business database not found", K(ret));
+  } else if (db_schema->is_in_recyclebin()) {
+    table_gone = true;
   } else if (OB_FAIL(ob_write_string(info.allocator_, db_schema->get_database_name(),
                                      info.db_name_))) {
   } else if (OB_FAIL(ObAiColumnUtil::select_metas_by_table(table_id, info.allocator_, info.metas_))) {
@@ -412,6 +423,9 @@ static int eval_task_prompt(ObAiWorkerTableInfo &info, const ObAiColumnMeta &met
 int ObAiColumnWorker::process_round()
 {
   int ret = OB_SUCCESS;
+  if (!ATOMIC_LOAD(&is_started_)) {
+    return OB_SUCCESS;
+  }
   int64_t now_us = ObTimeUtility::current_time();
   int64_t affected_rows = 0;
   ObArenaAllocator arena("AiColWorker");
@@ -491,6 +505,12 @@ int ObAiColumnWorker::process_round()
   }
 
   for (int64_t g = 0; OB_SUCC(ret) && g < group_heads.count(); ++g) {
+    // Failures belong to this request group. Keep its durable tasks for retry
+    // and allow unrelated groups and already collected stale deletes to run.
+    int ret = OB_SUCCESS;
+    if (!ATOMIC_LOAD(&is_started_)) {
+      return OB_SUCCESS;
+    }
     int64_t head = group_heads.at(g);
     uint64_t table_id = rows.at(head).table_id_;
     // indices of the group members
@@ -505,10 +525,13 @@ int ObAiColumnWorker::process_round()
       continue;
     }
     ObAiWorkerTableInfo info;
-    if (OB_FAIL(load_table_info(table_id, info))) {
-      // table gone: drop the whole group
-      LOG_WARN("worker cannot load table info, drop group", K(ret), K(table_id));
-      ret = OB_SUCCESS;
+    bool table_gone = false;
+    if (OB_FAIL(load_table_info(table_id, info, table_gone))) {
+      LOG_WARN("worker cannot load table info, preserve group for retry", K(ret), K(table_id));
+      continue;
+    } else if (table_gone) {
+      // Only a successfully resolved absent/recycled table makes the whole
+      // group stale. A recycled table still has a schema and table ID.
       for (int64_t i = 0; OB_SUCC(ret) && i < members.count(); ++i) {
         ObAiWorkerTask &tr = rows.at(members.at(i));
         ObSqlString del_sql;
@@ -544,19 +567,24 @@ int ObAiColumnWorker::process_round()
         }
       }
     }
-    if (rows.at(head).meta_idx_ < 0) {
-      // metas gone (column dropped): drop the group
-      for (int64_t i = 0; OB_SUCC(ret) && i < members.count(); ++i) {
-        ObAiWorkerTask &tr = rows.at(members.at(i));
+    // Metadata was read successfully. Clean only dropped columns; another
+    // column in the same request group may still be live and need its result.
+    int64_t live_members = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < members.count(); ++i) {
+      ObAiWorkerTask &tr = rows.at(members.at(i));
+      if (tr.meta_idx_ >= 0) {
+        ++live_members;
+      } else {
         ObSqlString del_sql;
         ObStringBuffer pb(&arena), qb(&arena);
         if (OB_FAIL(append_sql_escaped(pb, tr.rowkey_pred_))) {
         } else if (OB_FAIL(append_sql_escaped(qb, tr.request_id_))) {
         } else if (OB_FAIL(del_sql.assign_fmt(
                 "DELETE FROM %s WHERE table_id = %lu AND rowkey_predicate = '%.*s'"
-                " AND request_id = '%.*s'",
+                " AND column_id = %lu AND request_id = '%.*s'",
                 OB_ALL_AI_COLUMN_TASK_TNAME, table_id,
                 static_cast<int>(pb.length()), pb.ptr(),
+                tr.column_id_,
                 static_cast<int>(qb.length()), qb.ptr()))) {
         } else {
         ObString del_copy;
@@ -565,9 +593,12 @@ int ObAiColumnWorker::process_round()
         }
         }
       }
+    }
+    if (OB_FAIL(ret) || 0 == live_members) {
       continue;
     }
-    // resolve endpoint once per group
+    // Resolve the endpoint per nonterminal task below. A deleted endpoint of
+    // the first task must not block terminal peers or unrelated groups.
     omt::ObAiService *ai_service =
         ::oceanbase::share::server_service<::oceanbase::omt::ObAiService>();
     const ObAiModelEndpointInfo *endpoint = nullptr;
@@ -577,49 +608,21 @@ int ObAiColumnWorker::process_round()
     ObString url;
     ObString provider;
     ObAIFuncExprInfo *ai_func_info = nullptr;
-    const ObAiColumnMeta &head_meta = info.metas_.at(rows.at(head).meta_idx_);
     if (OB_ISNULL(ai_service)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(ai_service->get_ai_service_guard(ai_guard))) {
-    } else if (OB_FAIL(ai_guard.get_ai_endpoint_by_ai_model_name(
-                   head_meta.expr_.model_, endpoint, false /*need_check*/))) {
-      LOG_WARN("worker fail to resolve endpoint", K(ret));
-    } else if (OB_ISNULL(endpoint)) {
-      ret = OB_AI_FUNC_ENDPOINT_NOT_FOUND;
-      LOG_WARN("endpoint not found for ai column worker", K(ret));
-    } else if (OB_FAIL(endpoint->get_unencrypted_access_key(arena, access_key))) {
-    } else if (OB_FAIL(ob_write_string(arena, endpoint->get_url(), url, true))) {
-    } else if (OB_FAIL(ob_write_string(arena, endpoint->get_provider(), provider))) {
-    } else if (!endpoint->get_request_model_name().empty()) {
-      request_model_name = endpoint->get_request_model_name();
-    } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(arena, head_meta.expr_.model_,
-                                                       ai_func_info))
-               || OB_ISNULL(ai_func_info)) {
-      ret = OB_ERR_UNEXPECTED;
-    } else {
-      request_model_name = ai_func_info->model_;
     }
 
     ObArray<ObString> headers;
-    if (OB_SUCC(ret)) {
-      ObAIFuncIComplete *complete_provider = nullptr;
-      ObAIFuncIEmbed *embed_provider = nullptr;
-      if (head_meta.expr_.is_embed_) {
-        if (OB_FAIL(ObAIFuncUtils::get_embed_provider(arena, provider, embed_provider))) {
-        } else if (OB_FAIL(embed_provider->get_header(arena, access_key, headers))) {
-        }
-      } else {
-        if (OB_FAIL(ObAIFuncUtils::get_complete_provider(arena, provider, complete_provider))) {
-        } else if (OB_FAIL(complete_provider->get_header(arena, access_key, headers))) {
-        }
-      }
-    }
 
     if (OB_SUCC(ret)) {
       ObAIFuncClient client;
       ObSEArray<int64_t, 4> ok_tasks;
       ObSEArray<int64_t, 4> fail_tasks;
       for (int64_t i = 0; OB_SUCC(ret) && i < members.count(); ++i) {
+        if (!ATOMIC_LOAD(&is_started_)) {
+          return OB_SUCCESS;
+        }
         ObAiWorkerTask &tr = rows.at(members.at(i));
         if (tr.meta_idx_ < 0) {
           continue;
@@ -636,6 +639,9 @@ int ObAiColumnWorker::process_round()
         bool row_exists = false;
         if (OB_FAIL(eval_task_prompt(info, meta, tr, user_text, row_exists))) {
           LOG_WARN("worker fail to eval prompt", K(ret), K(tr.column_id_));
+        }
+        if (!ATOMIC_LOAD(&is_started_)) {
+          return OB_SUCCESS;
         }
         if (OB_SUCC(ret) && !row_exists) {
           // stale task (row deleted): drop it
@@ -692,6 +698,8 @@ int ObAiColumnWorker::process_round()
               if (OB_FAIL(contents.push_back(user_text))) {
               } else if (OB_FAIL(embed_provider->get_body(arena, request_model_name, contents,
                                                           nullptr, body))) {
+              } else if (!ATOMIC_LOAD(&is_started_)) {
+                return OB_SUCCESS;
               } else if (OB_FAIL(http_ret = client.send_post(arena, url, headers, body, response))) {
               } else if (OB_FAIL(embed_provider->parse_output(arena, response, result_base))) {
               } else if (OB_ISNULL(result_base)) {
@@ -719,6 +727,8 @@ int ObAiColumnWorker::process_round()
             } else if (OB_FAIL(complete_provider->get_body(arena, request_model_name,
                                                            sys_prompt_nc,
                                                            user_text_nc, nullptr, body))) {
+            } else if (!ATOMIC_LOAD(&is_started_)) {
+              return OB_SUCCESS;
             } else if (OB_FAIL(http_ret = client.send_post(arena, url, headers, body, response))) {
             } else if (OB_FAIL(complete_provider->parse_output(arena, response, result_base))) {
             } else if (OB_ISNULL(result_base)) {
@@ -731,6 +741,12 @@ int ObAiColumnWorker::process_round()
                 ok = true;
               }
             }
+          }
+          if (!ATOMIC_LOAD(&is_started_)) {
+            // Let an in-flight HTTP call finish normally, then stop before
+            // another request or write-back. Its durable task remains queued
+            // for a future worker; no partially completed group is published.
+            return OB_SUCCESS;
           }
           if (OB_FAIL(ret)) {
             // local error: treat as request failure and continue with other tasks
@@ -757,6 +773,9 @@ int ObAiColumnWorker::process_round()
 
       // Stage successful results while peers retry, so completed model calls
       // are not repeated and a restart can resume the same request group.
+      if (!ATOMIC_LOAD(&is_started_)) {
+        return OB_SUCCESS;
+      }
       if (OB_SUCC(ret) && !fail_tasks.empty()) {
         ObSEArray<ObString, 8> stage_sqls;
         for (int64_t i = 0; OB_SUCC(ret) && i < ok_tasks.count(); ++i) {
@@ -777,6 +796,9 @@ int ObAiColumnWorker::process_round()
           } else if (OB_FAIL(stage_sqls.push_back(copy))) {
           }
         }
+        if (!ATOMIC_LOAD(&is_started_)) {
+          return OB_SUCCESS;
+        }
         if (OB_SUCC(ret) && !stage_sqls.empty()) {
           ret = exec_sqls_in_job_session(stage_sqls);
         }
@@ -791,6 +813,9 @@ int ObAiColumnWorker::process_round()
         ObSEArray<ObString, 8> delete_sqls;
         // pass A: staleness check on the plain proxy (reads work from timer threads)
         for (int64_t i = 0; OB_SUCC(ret) && i < ok_tasks.count(); ++i) {
+          if (!ATOMIC_LOAD(&is_started_)) {
+            return OB_SUCCESS;
+          }
           ObAiWorkerTask &tr = rows.at(ok_tasks.at(i));
           ObStringBuffer pb(&arena), qb(&arena);
           if (OB_FAIL(append_sql_escaped(pb, tr.rowkey_pred_))) {
@@ -895,6 +920,9 @@ int ObAiColumnWorker::process_round()
         for (int64_t i = 0; OB_SUCC(ret) && i < delete_sqls.count(); ++i) {
           if (OB_FAIL(write_sqls.push_back(delete_sqls.at(i)))) {}
         }
+        if (!ATOMIC_LOAD(&is_started_)) {
+          return OB_SUCCESS;
+        }
         if (OB_SUCC(ret) && write_sqls.count() > 0) {
           if (OB_FAIL(exec_sqls_in_job_session(write_sqls))) {
             // Conversion/write failures use the same bounded retry policy.
@@ -948,6 +976,9 @@ int ObAiColumnWorker::process_round()
             }
           }
         }
+        if (!ATOMIC_LOAD(&is_started_)) {
+          return OB_SUCCESS;
+        }
         if (OB_SUCC(ret) && fail_sqls.count() > 0) {
           if (OB_FAIL(exec_sqls_in_job_session(fail_sqls))) {
             ret = OB_SUCCESS;  // retried on the next scan
@@ -955,6 +986,12 @@ int ObAiColumnWorker::process_round()
         }
       }
     }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("ai column request group failed, preserve durable tasks", K(ret), K(table_id));
+    }
+  }
+  if (!ATOMIC_LOAD(&is_started_)) {
+    return OB_SUCCESS;
   }
   if (OB_SUCC(ret) && stale_del_sqls.count() > 0) {
     if (OB_FAIL(exec_sqls_in_job_session(stale_del_sqls))) {
