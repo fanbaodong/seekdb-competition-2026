@@ -13,6 +13,37 @@ import time
 import pymysql
 
 
+def run_registration_case(port):
+    """Run on a fresh instance built without objects from before the new sysvar."""
+    def connect():
+        return pymysql.connect(host='127.0.0.1', port=port, user='root',
+                               autocommit=True, connect_timeout=5, read_timeout=15)
+
+    # Missing bootstrap registration fails in the handshake, before any SQL.
+    db = connect()
+    try:
+        with db.cursor() as cur:
+            cur.execute('SELECT @@global.ai_column_strict_read, @@session.ai_column_strict_read')
+            assert cur.fetchone() == (0, 0), 'fresh instance must default to non-strict reads'
+            try:
+                cur.execute('SET GLOBAL ai_column_strict_read=ON')
+                fresh = connect()
+                try:
+                    with fresh.cursor() as new_cur:
+                        new_cur.execute('SELECT @@session.ai_column_strict_read')
+                        assert new_cur.fetchone() == (1,), 'new connection must inherit the global value'
+                        new_cur.execute('SET SESSION ai_column_strict_read=OFF')
+                        new_cur.execute('SELECT @@global.ai_column_strict_read, @@session.ai_column_strict_read')
+                        assert new_cur.fetchone() == (1, 0), 'session override must not change the global value'
+                finally:
+                    fresh.close()
+            finally:
+                cur.execute('SET GLOBAL ai_column_strict_read=OFF')
+    finally:
+        db.close()
+    print('PASS: fresh login, strict-read default, global inheritance and session override', flush=True)
+
+
 def run_endpoint_lifecycle_case(port, recycle):
     """Keep one HTTP call in flight while another durable task loses its endpoint."""
     case = 'recyclebin-orphan' if recycle else 'missing-endpoint'
@@ -179,9 +210,13 @@ def run_endpoint_lifecycle_case(port, recycle):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=2895)
-    parser.add_argument('--case', choices=('all', 'existing', 'lifecycle',
+    parser.add_argument('--case', choices=('all', 'existing', 'registration', 'lifecycle',
                                           'recyclebin-orphan', 'missing-endpoint'), default='all')
     args = parser.parse_args()
+    if args.case in ('all', 'registration'):
+        run_registration_case(args.port)
+    if args.case == 'registration':
+        return
     if args.case not in ('all', 'existing'):
         if args.case in ('lifecycle', 'recyclebin-orphan'):
             run_endpoint_lifecycle_case(args.port, recycle=True)

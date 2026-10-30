@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_SESSION
 #include "sql/session/ob_system_variable_factory.h"
+#include "lib/ob_check_macros.h"
 #include "lib/utility/ob_smart_call.h"
 #include "share/system_variable/ob_system_variable_init.h"
 #include "share/system_variable/ob_sys_var_meta.h"

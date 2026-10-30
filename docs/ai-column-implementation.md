@@ -150,3 +150,70 @@ unchanged. The final runtime binary SHA256 is
 This demonstrates a real cross-test queue-stall defect. Without the competition
 runner logs, it does not uniquely establish the platform execution-failure
 cause or guarantee the next platform score.
+
+## Independent compilation audit (2026-10-30)
+
+The earlier runtime results used an existing incremental build tree. They did
+not establish that the submitted revision would work when built from scratch.
+The clean-build audit below supersedes that assumption.
+
+`ob_system_variable_factory.cpp` used `OV` and `OX` without including their
+definition. Its Unity group supplied the macros indirectly, but compiling the
+file as its own translation unit failed with undeclared-identifier errors.
+The file now includes `lib/ob_check_macros.h` explicitly. With otherwise
+identical compiler arguments, the original file fails and the repaired file
+passes. This issue also existed in the pre-AI-column baseline; it is not proof
+of the competition runner's failure cause.
+
+The cached binary for `5286a23de217559dafabdcf544f874692b856733` also passed
+all five original AI-column tests through the repository's CI runner helpers
+and default `sdb.py` startup, rather than only through a custom startup command.
+A local blocked HTTP request survived stopping and restarting the database:
+the persisted task completed after restart and its task row was removed.
+The original SQL inputs and expected results were unchanged.
+
+## Clean-build bootstrap registration failure (2026-10-30)
+
+A separate Linux source tree was extracted from the submitted revision. Its
+release build reused only the third-party toolchain, with no old C++/Rust
+objects, parser cache or ccache. With the explicit factory include above, it
+built successfully but every MySQL handshake failed with error 1193, before
+any competition SQL could run. The server log identifies `sys_var_id=10755`,
+`i=720`, `ret=-5044` in `ObBasicSessionInfo::load_all_sys_vars`.
+
+The new `ai_column_strict_read` variable increased the metadata count to 721,
+but `ob_system_variable_init.cpp` still initialized `var_amount` to 720.
+`ObSysVariableSchema::load_default_system_variable` therefore omitted the last
+variable, while login required all 721. This is a reproduced startup/login
+defect; the platform itself does not expose logs confirming its failure stage.
+
+The initialization count now derives from `ObSysVarMeta::ALL_SYS_VARS_COUNT`.
+The generator emits the same definition and the factory's explicit macro
+include, so regeneration preserves both repairs. Isolated regeneration and
+comparison with the JSON source confirm that both generated and checked-in
+metadata contain all 721 registered variables.
+
+The runtime regression's `--case registration` checks a fresh connection,
+default strict-read value, inheritance by a new session after `SET GLOBAL`,
+and isolation of a session override. It fails at the handshake on the retained
+clean-build binary (SHA256
+`34740a474aaa1eff537de3299ba2d05138e55fbf7b4b091f392eca52742dec63`).
+Run this test on a newly initialized disposable instance built from clean
+source; a stale binary or an already populated schema can hide the defect.
+
+After applying the registration fix in that same clean build tree, the release
+build and link succeeded. The repaired binary SHA256 is
+`38dfd507ad37eacc7315ab38be497b942b8811a77965f0091c8bd34cd32cd422`.
+A separate new database accepted login in 2.05 seconds and passed all five
+original AI-column mysqltests with CI initialization and admin/test identity,
+the registration and existing runtime regressions, AI-function enhancement,
+and File SQL mysqltest plus supplemental runtime checks. Competition SQL and
+expected results were not changed; File SQL used local fixture preparation.
+
+The user also reported a 10-second model-drop timeout on the earlier baseline
+without AI columns. A local probe kept that same query timeout and exercised
+80 model drops across two concurrent admin/test sessions (existing and missing
+models); all returned the expected result, with a maximum latency of 0.027
+seconds. The timeout was not reproduced and no speculative timeout workaround
+was added. These are local results; the repaired revision still needs platform
+evaluation.
