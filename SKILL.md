@@ -108,3 +108,5 @@ COPY (SELECT id, city, amount FROM read_csv('/data/orders.csv') ORDER BY id)
 
 - `references/file-sql-cheatsheet.md`：函数、选项、类型规则完整速查。
 - `scripts/run_file_sql.py`：通过 MySQL 协议执行一条文件 SQL 的小工具，便于快速验证。
+
+<!-- OB-S:0mY5n1SuGvQYIZhFUf3Zig -->
