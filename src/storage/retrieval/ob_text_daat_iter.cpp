@@ -99,11 +99,115 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
           || dim_iters_->count() <= ObSRSimpleMerger::USE_SIMPLE_MERGER_MAX_TABLE_CNT)
       && (meta->type_ == common::ObUInt64Type
           || (meta->type_ == common::ObVarcharType && meta->cs_type_ == CS_TYPE_BINARY))) {
-    return nullptr == iter_param_->relevance_expr_ && iter_param_->eval_ctx_->is_vectorized()
-        && iter_param_->id_proj_expr_->is_batch_result()
-        ? get_presence_union_rows(capacity, count) : get_short_union_rows(capacity, count);
+    if (nullptr == iter_param_->relevance_expr_ && iter_param_->eval_ctx_->is_vectorized()
+        && iter_param_->id_proj_expr_->is_batch_result()) {
+      return dim_iters_->count() == 2 ? get_fixed_presence_union_rows<2>(capacity, count)
+          : dim_iters_->count() == 3 ? get_fixed_presence_union_rows<3>(capacity, count)
+          : get_presence_union_rows(capacity, count);
+    }
+    return get_short_union_rows(capacity, count);
   }
   return ObSRDaaTIterImpl::get_next_rows(capacity, count);
+}
+
+template <int64_t DIMS>
+int ObTextDaaTIter::get_fixed_presence_union_rows(const int64_t capacity, int64_t &count)
+{
+  static_assert(DIMS == 2 || DIMS == 3);
+  int ret = OB_SUCCESS;
+  count = 0;
+  const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+  const common::ObLimitParam &limit = *iter_param_->limit_param_;
+  const bool integer_id = iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type;
+  ObDatum *output_ids = iter_param_->id_proj_expr_->locate_batch_datums(*iter_param_->eval_ctx_);
+  bool scan_datums_restored = false;
+  bool refill_needed = true;
+  if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+    ret = OB_ITER_END;
+  }
+  while (OB_SUCC(ret) && count < real_capacity && refill_needed) {
+    // Refills may write through the shared scan expression. Once an output ID
+    // borrows a child buffer, return it before allowing any further refill.
+    if (count > 0) {
+      break;
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < DIMS; ++i) {
+      PresenceIdBatch &batch = presence_batches_[i];
+      if (!batch.ended_ && batch.pos_ == batch.count_) {
+        if (!scan_datums_restored) {
+          iter_param_->id_proj_expr_->locate_datums_for_update(
+              *iter_param_->eval_ctx_, iter_param_->max_batch_size_);
+          scan_datums_restored = true;
+        }
+        auto *token = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i));
+        if (OB_FAIL(token->get_next_doc_id_batch(batch.ids_, batch.count_))) {
+          if (OB_ITER_END == ret) {
+            batch.ended_ = true;
+            ret = OB_SUCCESS;
+          }
+        } else if (OB_UNLIKELY(batch.count_ <= 0 || nullptr == batch.ids_)) {
+          ret = OB_ERR_UNEXPECTED;
+        }
+        batch.pos_ = 0;
+      }
+    }
+    refill_needed = false;
+    // A fixed small fan-in needs only one comparison per remaining head.
+    // Do not find a second minimum, allocate a winner list, or recheck refill
+    // conditions for every emitted ID. Equal heads advance together.
+    while (OB_SUCC(ret) && !refill_needed && count < real_capacity) {
+      const ObDatum *minimum = nullptr;
+      uint32_t equal_mask = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i < DIMS; ++i) {
+        const PresenceIdBatch &batch = presence_batches_[i];
+        if (!batch.ended_) {
+          const ObDatum &head = batch.ids_[batch.pos_].get_datum_fast();
+          int comparison = -1;
+          if (OB_UNLIKELY(head.is_null())) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (nullptr != minimum) {
+            if (integer_id) {
+              comparison = head.get_uint64() < minimum->get_uint64() ? -1
+                  : (head.get_uint64() > minimum->get_uint64() ? 1 : 0);
+            } else {
+              ret = compare_binary_retrieval_id(head, *minimum, comparison, nullptr);
+            }
+          }
+          if (comparison < 0) {
+            minimum = &head;
+            equal_mask = 1U << i;
+          } else if (comparison == 0) {
+            equal_mask |= 1U << i;
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (nullptr == minimum) {
+        ret = OB_ITER_END;
+      } else {
+        ++input_row_cnt_;
+        if (!limit.is_valid() || input_row_cnt_ > limit.offset_) {
+          output_ids[count++].set_datum(*minimum);
+          ++output_row_cnt_;
+          if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+            ret = OB_ITER_END;
+          }
+        }
+        for (int64_t i = 0; i < DIMS; ++i) {
+          if ((equal_mask & (1U << i)) != 0) {
+            PresenceIdBatch &batch = presence_batches_[i];
+            ++batch.pos_;
+            refill_needed |= batch.pos_ == batch.count_;
+          }
+        }
+      }
+    }
+  }
+  if ((OB_SUCC(ret) || OB_ITER_END == ret) && count > 0) {
+    project_presence_results(count);
+    ret = OB_SUCCESS;
+  }
+  return ret;
 }
 
 int ObTextDaaTIter::get_presence_union_rows(const int64_t capacity, int64_t &count)

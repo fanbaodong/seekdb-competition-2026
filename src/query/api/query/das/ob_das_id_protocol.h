@@ -40,6 +40,7 @@ public:
 
   int hash(uint64_t &hash_val) const;
   const common::ObDatum &get_datum() const;
+  OB_INLINE const common::ObDatum &get_datum_fast() const { return datum_; }
   int from_datum(const common::ObDatum &datum);
   OB_INLINE int from_datum_fast(const common::ObDatum &datum)
   {

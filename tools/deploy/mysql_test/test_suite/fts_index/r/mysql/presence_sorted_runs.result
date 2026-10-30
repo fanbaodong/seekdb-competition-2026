@@ -50,6 +50,26 @@ select /*+ opt_param('ROWSETS_MAX_ROWS',128) */ count(*),sum(id),sum(id*id)
 from presence_sorted_runs where match(content) against('alpha alpha missingword');
 count(*)	sum(id)	sum(id*id)
 113	10113	1431025
+select /*+ opt_param('ROWSETS_MAX_ROWS',1) */ count(*),sum(id),sum(id*id),bit_xor(id)
+from presence_sorted_runs where match(content) against('alpha beta gamma');
+count(*)	sum(id)	sum(id*id)	bit_xor(id)
+193	18721	2415009	1
+select /*+ opt_param('ROWSETS_MAX_ROWS',2) */ count(*),sum(id),sum(id*id),bit_xor(id)
+from presence_sorted_runs where match(content) against('gamma beta alpha');
+count(*)	sum(id)	sum(id*id)	bit_xor(id)
+193	18721	2415009	1
+select /*+ opt_param('ROWSETS_MAX_ROWS',7) */ count(*),sum(id),sum(id*id),bit_xor(id)
+from presence_sorted_runs where match(content) against('missingword alpha gamma');
+count(*)	sum(id)	sum(id*id)	bit_xor(id)
+114	10306	1468274	128
+select count(*) from (select /*+ opt_param('ROWSETS_MAX_ROWS',1) */ id
+from presence_sorted_runs where match(content) against('alpha beta gamma') limit 12 offset 185) v;
+count(*)
+8
+select count(*) from (select /*+ opt_param('ROWSETS_MAX_ROWS',2) */ id
+from presence_sorted_runs where match(content) against('alpha beta gamma') limit 12 offset 193) v;
+count(*)
+0
 select count(*) from (select /*+ opt_param('ROWSETS_MAX_ROWS',1) */ id
 from presence_sorted_runs where match(content) against('alpha beta') limit 1 offset 64) v;
 count(*)

@@ -67,6 +67,8 @@ protected:
   virtual int pre_process() override;
   int get_short_union_rows(const int64_t capacity, int64_t &count);
   int get_presence_union_rows(const int64_t capacity, int64_t &count);
+  template <int64_t DIMS>
+  int get_fixed_presence_union_rows(const int64_t capacity, int64_t &count);
   void project_presence_results(const int64_t count);
 protected:
   static constexpr int64_t SHORT_UNION_MAX_DIMS = 8;

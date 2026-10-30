@@ -36,6 +36,17 @@ select /*+ opt_param('ROWSETS_MAX_ROWS',128) */ count(*),sum(id),sum(id*id)
   from presence_sorted_runs where match(content) against('alpha beta gamma');
 select /*+ opt_param('ROWSETS_MAX_ROWS',128) */ count(*),sum(id),sum(id*id)
   from presence_sorted_runs where match(content) against('alpha alpha missingword');
+# Fixed fan-in merge must survive a refill on every row and exhausted streams.
+select /*+ opt_param('ROWSETS_MAX_ROWS',1) */ count(*),sum(id),sum(id*id),bit_xor(id)
+  from presence_sorted_runs where match(content) against('alpha beta gamma');
+select /*+ opt_param('ROWSETS_MAX_ROWS',2) */ count(*),sum(id),sum(id*id),bit_xor(id)
+  from presence_sorted_runs where match(content) against('gamma beta alpha');
+select /*+ opt_param('ROWSETS_MAX_ROWS',7) */ count(*),sum(id),sum(id*id),bit_xor(id)
+  from presence_sorted_runs where match(content) against('missingword alpha gamma');
+select count(*) from (select /*+ opt_param('ROWSETS_MAX_ROWS',1) */ id
+  from presence_sorted_runs where match(content) against('alpha beta gamma') limit 12 offset 185) v;
+select count(*) from (select /*+ opt_param('ROWSETS_MAX_ROWS',2) */ id
+  from presence_sorted_runs where match(content) against('alpha beta gamma') limit 12 offset 193) v;
 # Cardinality-only LIMIT preserves the number of unique rows after OFFSET.
 select count(*) from (select /*+ opt_param('ROWSETS_MAX_ROWS',1) */ id
   from presence_sorted_runs where match(content) against('alpha beta') limit 1 offset 64) v;
