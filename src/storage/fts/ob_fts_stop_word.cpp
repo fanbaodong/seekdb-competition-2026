@@ -21,6 +21,7 @@
 #include "storage/fts/ob_fts_stop_word.h"
 #include "storage/fts/ob_fts_parser_helper.h"
 #include "storage/fts/ob_fts_parser_property.h"
+#include <algorithm>
 
 namespace oceanbase
 {
@@ -57,6 +58,14 @@ int ObStopWordChecker::init()
     }
 
     if (OB_SUCC(ret)) {
+      ascii_stopwords_valid_ = true;
+      for (int64_t i = 0; ascii_stopwords_valid_ && i < STOPWORD_COUNT; ++i) {
+        ascii_stopwords_valid_ = encode_ascii_word(ObString::make_string(ob_stop_word_list[i]),
+                                                  ascii_stopwords_[i]);
+      }
+      if (ascii_stopwords_valid_) {
+        std::sort(ascii_stopwords_, ascii_stopwords_ + STOPWORD_COUNT);
+      }
       inited_ = true;
     }
   }
@@ -67,8 +76,27 @@ void ObStopWordChecker::destroy()
 {
   if (inited_) {
     stopword_set_.destroy();
+    ascii_stopwords_valid_ = false;
     inited_ = false;
   }
+}
+
+bool ObStopWordChecker::encode_ascii_word(const ObString &word, uint64_t &code)
+{
+  // Nonzero five-bit digits encode both letters and length without collisions.
+  // Restrict this path to ASCII letters: general_ci can also equate accented
+  // or space-padded strings, which must go through the existing charset code.
+  bool supported = word.length() > 0 && word.length() <= 12;
+  code = 0;
+  for (int64_t i = 0; supported && i < word.length(); ++i) {
+    const unsigned char letter = static_cast<unsigned char>(word.ptr()[i]) | 0x20;
+    if (letter < 'a' || letter > 'z') {
+      supported = false;
+    } else {
+      code = (code << 5) | (letter - 'a' + 1);
+    }
+  }
+  return supported;
 }
 
 int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
@@ -79,7 +107,13 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    if (common::ObCharset::charset_type_by_coll(word.get_collation_type())
+    uint64_t ascii_code = 0;
+    if (ascii_stopwords_valid_
+        && common::ObCharset::charset_type_by_coll(word.get_collation_type()) == common::CHARSET_UTF8MB4
+        && encode_ascii_word(word.get_word().get_string(), ascii_code)) {
+      is_stopword = std::binary_search(ascii_stopwords_, ascii_stopwords_ + STOPWORD_COUNT, ascii_code);
+      return OB_SUCCESS;
+    } else if (common::ObCharset::charset_type_by_coll(word.get_collation_type())
         == common::ObCharset::charset_type_by_coll(stopword_type_.get_collation_type())) {
       // Collation changes within one charset do not require transcoding.
       const common::ObString cmp_str = word.get_word().get_string();

@@ -37,12 +37,23 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
   } else {
     mode_flag_ = param.mode_flag_;
     function_lookup_mode_ = param.function_lookup_mode_;
+    if (nullptr == param.base_param_->relevance_expr_
+        && param.dim_iters_->count() <= SHORT_UNION_MAX_DIMS) {
+      presence_output_ids_.set_allocator(param.allocator_);
+      if (OB_FAIL(presence_output_ids_.init(param.base_param_->max_batch_size_))) {
+      } else if (OB_FAIL(presence_output_ids_.prepare_allocate(param.base_param_->max_batch_size_))) {
+      }
+    }
   }
   return ret;
 }
 
 void ObTextDaaTIter::reset()
 {
+  for (int64_t i = 0; i < SHORT_UNION_MAX_DIMS; ++i) {
+    presence_batches_[i].reset();
+  }
+  presence_output_ids_.reset();
   bm25_param_estimator_.reset();
   // this class can know the type of dim_iters_, but ObSRDaaTIterImpl maybe not
   if (OB_NOT_NULL(dim_iters_)) {
@@ -55,6 +66,9 @@ void ObTextDaaTIter::reset()
 
 void ObTextDaaTIter::reuse(const bool switch_tablet)
 {
+  for (int64_t i = 0; i < SHORT_UNION_MAX_DIMS; ++i) {
+    presence_batches_[i].reset();
+  }
   if ((OB_NOT_NULL(dim_iters_) && 0 == dim_iters_->count())) {
     // do nothing
   } else {
@@ -88,14 +102,178 @@ int ObTextDaaTIter::get_next_rows(const int64_t capacity, int64_t &count)
   // in the same iterator-index order, preserving floating-point results.
   if (nullptr != meta
       && mode_flag_ == sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE
-      && !function_lookup_mode_ && dim_iters_->count() > 0 && dim_iters_->count() <= 8
+      && !function_lookup_mode_ && dim_iters_->count() > 0 && dim_iters_->count() <= SHORT_UNION_MAX_DIMS
       && (nullptr == iter_param_->relevance_expr_
           || dim_iters_->count() <= ObSRSimpleMerger::USE_SIMPLE_MERGER_MAX_TABLE_CNT)
       && (meta->type_ == common::ObUInt64Type
           || (meta->type_ == common::ObVarcharType && meta->cs_type_ == CS_TYPE_BINARY))) {
-    return get_short_union_rows(capacity, count);
+    return nullptr == iter_param_->relevance_expr_ && iter_param_->eval_ctx_->is_vectorized()
+        && iter_param_->id_proj_expr_->is_batch_result()
+        ? get_presence_union_rows(capacity, count) : get_short_union_rows(capacity, count);
   }
   return ObSRDaaTIterImpl::get_next_rows(capacity, count);
+}
+
+int ObTextDaaTIter::get_presence_union_rows(const int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  const int64_t dim_count = dim_iters_->count();
+  const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+  const common::ObLimitParam &limit = *iter_param_->limit_param_;
+  const bool integer_id = iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type;
+  int64_t equal_heads[SHORT_UNION_MAX_DIMS];
+  const ObDatum **output_ids = presence_output_ids_.get_data();
+  bool batch_boundary = false;
+  bool scan_datums_restored = false;
+  const auto cache_id = [&](const ObDatum &id) {
+    ++input_row_cnt_;
+    if (limit.is_valid() && input_row_cnt_ <= limit.offset_) {
+      // OFFSET consumes IDs but does not retain their buffer references.
+    } else {
+      OB_ASSERT(count < real_capacity && count < presence_output_ids_.count());
+      output_ids[count++] = &id;
+      ++output_row_cnt_;
+      if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+        ret = OB_ITER_END;
+      }
+    }
+  };
+  const auto compare_id = [integer_id, &ret](const ObDatum &left, const ObDatum &right) {
+    if (integer_id) {
+      return left.get_uint64() < right.get_uint64() ? -1
+          : (left.get_uint64() > right.get_uint64() ? 1 : 0);
+    }
+    int comparison = 0;
+    // This path accepts only non-null stored IDs with binary semantics. The
+    // helper also preserves extend-datum handling and variable-length ordering.
+    const int cmp_ret = compare_binary_retrieval_id(left, right, comparison, nullptr);
+    if (OB_UNLIKELY(OB_SUCCESS != cmp_ret)) {
+      ret = cmp_ret;
+    }
+    return comparison;
+  };
+  if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
+    ret = OB_ITER_END;
+  }
+  while (OB_SUCC(ret) && !batch_boundary && count < real_capacity) {
+    const ObDatum *minimum = nullptr;
+    const ObDatum *second = nullptr;
+    int64_t equal_count = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < dim_count; ++i) {
+      PresenceIdBatch &batch = presence_batches_[i];
+      if (!batch.ended_ && batch.pos_ == batch.count_) {
+        // Returned rows alias these child-owned buffers. Once this output
+        // batch retains any ID, finish it before allowing another child read:
+        // all borrowed IDs then stay valid until our next get_next_rows call.
+        if (count > 0) {
+          batch_boundary = true;
+          break;
+        }
+        if (!scan_datums_restored) {
+          // The projection and all inverted-index scans share this expression.
+          // The previous output may have pointed its datums into one child's
+          // ID cache. Detach every scan slot before a storage reader writes to
+          // it, or that reader can overwrite another child's unconsumed head.
+          // No aliases are projected again until this call returns, so this is
+          // needed only before the first refill in the current call.
+          iter_param_->id_proj_expr_->locate_datums_for_update(
+              *iter_param_->eval_ctx_, iter_param_->max_batch_size_);
+          scan_datums_restored = true;
+        }
+        auto *token = static_cast<ObTextRetrievalDaaTTokenIter *>(dim_iters_->at(i));
+        if (OB_FAIL(token->get_next_doc_id_batch(batch.ids_, batch.count_))) {
+          if (OB_ITER_END == ret) {
+            batch.ended_ = true;
+            ret = OB_SUCCESS;
+          }
+        }
+        batch.pos_ = 0;
+      }
+      if (OB_FAIL(ret) || batch.ended_) {
+      } else {
+        const ObDatum &head = batch.ids_[batch.pos_].get_datum();
+        if (OB_UNLIKELY(head.is_null())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const int comparison = nullptr == minimum ? -1 : compare_id(head, *minimum);
+          if (comparison < 0) {
+            second = minimum;
+            minimum = &head;
+            equal_count = 0;
+          } else if (comparison > 0
+              && (nullptr == second || compare_id(head, *second) < 0)) {
+            second = &head;
+          }
+          if (comparison <= 0) {
+            equal_heads[equal_count++] = i;
+          }
+        }
+      }
+    }
+    if (OB_FAIL(ret) || batch_boundary) {
+    } else if (nullptr == minimum) {
+      ret = OB_ITER_END;
+    } else if (equal_count > 1) {
+      cache_id(*minimum);
+      for (int64_t i = 0; i < equal_count; ++i) {
+        ++presence_batches_[equal_heads[i]].pos_;
+      }
+    } else {
+      PresenceIdBatch &batch = presence_batches_[equal_heads[0]];
+      // Drain a disjoint sorted run without repeating all head comparisons.
+      // Stop before the second head so overlaps are deduplicated above. Neither
+      // buffer can refill within this loop, including when an output batch ends.
+      while (OB_SUCC(ret) && count < real_capacity && batch.pos_ < batch.count_) {
+        const ObDatum &id = batch.ids_[batch.pos_].get_datum();
+        if (OB_UNLIKELY(id.is_null())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const int comparison = nullptr == second ? -1 : compare_id(id, *second);
+          if (OB_FAIL(ret)) {
+          } else if (comparison >= 0) {
+            break;
+          } else {
+            cache_id(id);
+            ++batch.pos_;
+          }
+        }
+      }
+    }
+  }
+  if ((OB_SUCC(ret) || OB_ITER_END == ret) && count > 0) {
+    project_presence_results(count);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+void ObTextDaaTIter::project_presence_results(const int64_t count)
+{
+  ObEvalCtx &eval_ctx = *iter_param_->eval_ctx_;
+  ObExpr &id_expr = *iter_param_->id_proj_expr_;
+  ObDatum *id_datums = id_expr.locate_batch_datums(eval_ctx);
+  const ObDatum *const *output_ids = presence_output_ids_.get_data();
+  for (int64_t i = 0; i < count; ++i) {
+    id_datums[i].set_datum(*output_ids[i]);
+  }
+  id_expr.get_evaluated_flags(eval_ctx).set_all(count);
+  id_expr.set_evaluated_projected(eval_ctx);
+  if (iter_param_->need_project_relevance()) {
+    ObExpr &presence_expr = *iter_param_->relevance_proj_expr_;
+    const int64_t size = presence_expr.is_batch_result() ? count : 1;
+    // set_double writes through datum.ptr_; locate_batch_datums alone does not
+    // initialize it. Restore this expression's reserved buffers for either its
+    // batch slots or its single scalar slot before writing the presence value.
+    ObDatum *presence_datums = presence_expr.locate_datums_for_update(eval_ctx, size);
+    for (int64_t i = 0; i < size; ++i) {
+      presence_datums[i].set_double(1.0);
+    }
+    if (presence_expr.is_batch_result()) {
+      presence_expr.get_evaluated_flags(eval_ctx).set_all(count);
+    }
+    presence_expr.set_evaluated_projected(eval_ctx);
+  }
 }
 
 int ObTextDaaTIter::get_short_union_rows(const int64_t capacity, int64_t &count)
