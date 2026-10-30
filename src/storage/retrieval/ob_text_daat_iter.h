@@ -56,8 +56,7 @@ public:
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
       function_lookup_mode_(false),
-      presence_batches_{},
-      presence_output_ids_() {}
+      presence_batches_{} {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
@@ -83,7 +82,6 @@ protected:
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
   PresenceIdBatch presence_batches_[SHORT_UNION_MAX_DIMS];
-  ObFixedArray<const ObDatum *, ObIAllocator> presence_output_ids_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };

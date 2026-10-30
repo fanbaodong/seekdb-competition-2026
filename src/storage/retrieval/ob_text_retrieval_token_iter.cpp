@@ -539,7 +539,7 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
       ObDocIdExt *ids = doc_id_.get_data();
       const ObDatum *datums = doc_id_datum.datums_;
       for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-        if (OB_FAIL(ids[i].from_datum(datums[i]))) {
+        if (OB_FAIL(ids[i].from_datum_fast(datums[i]))) {
         }
       }
     } else {

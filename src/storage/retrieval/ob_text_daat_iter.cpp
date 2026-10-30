@@ -37,13 +37,6 @@ int ObTextDaaTIter::init(const ObTextDaaTParam &param)
   } else {
     mode_flag_ = param.mode_flag_;
     function_lookup_mode_ = param.function_lookup_mode_;
-    if (nullptr == param.base_param_->relevance_expr_
-        && param.dim_iters_->count() <= SHORT_UNION_MAX_DIMS) {
-      presence_output_ids_.set_allocator(param.allocator_);
-      if (OB_FAIL(presence_output_ids_.init(param.base_param_->max_batch_size_))) {
-      } else if (OB_FAIL(presence_output_ids_.prepare_allocate(param.base_param_->max_batch_size_))) {
-      }
-    }
   }
   return ret;
 }
@@ -53,7 +46,6 @@ void ObTextDaaTIter::reset()
   for (int64_t i = 0; i < SHORT_UNION_MAX_DIMS; ++i) {
     presence_batches_[i].reset();
   }
-  presence_output_ids_.reset();
   bm25_param_estimator_.reset();
   // this class can know the type of dim_iters_, but ObSRDaaTIterImpl maybe not
   if (OB_NOT_NULL(dim_iters_)) {
@@ -123,23 +115,26 @@ int ObTextDaaTIter::get_presence_union_rows(const int64_t capacity, int64_t &cou
   const common::ObLimitParam &limit = *iter_param_->limit_param_;
   const bool integer_id = iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type;
   int64_t equal_heads[SHORT_UNION_MAX_DIMS];
-  const ObDatum **output_ids = presence_output_ids_.get_data();
+  ObDatum *output_ids = iter_param_->id_proj_expr_->locate_batch_datums(*iter_param_->eval_ctx_);
   bool batch_boundary = false;
   bool scan_datums_restored = false;
-  const auto cache_id = [&](const ObDatum &id) {
+  const auto cache_id = [&](const ObDatum &id) __attribute__((always_inline)) {
     ++input_row_cnt_;
     if (limit.is_valid() && input_row_cnt_ <= limit.offset_) {
       // OFFSET consumes IDs but does not retain their buffer references.
     } else {
-      OB_ASSERT(count < real_capacity && count < presence_output_ids_.count());
-      output_ids[count++] = &id;
+      OB_ASSERT(count < real_capacity);
+      // Child caches own these bytes. Once any ID has been projected, the
+      // refill guard below keeps all of those caches stable until we return.
+      output_ids[count++].set_datum(id);
       ++output_row_cnt_;
       if (limit.is_valid() && output_row_cnt_ >= limit.limit_) {
         ret = OB_ITER_END;
       }
     }
   };
-  const auto compare_id = [integer_id, &ret](const ObDatum &left, const ObDatum &right) {
+  const auto compare_id = [integer_id, &ret](const ObDatum &left, const ObDatum &right)
+      __attribute__((always_inline)) {
     if (integer_id) {
       return left.get_uint64() < right.get_uint64() ? -1
           : (left.get_uint64() > right.get_uint64() ? 1 : 0);
@@ -175,8 +170,9 @@ int ObTextDaaTIter::get_presence_union_rows(const int64_t capacity, int64_t &cou
           // The previous output may have pointed its datums into one child's
           // ID cache. Detach every scan slot before a storage reader writes to
           // it, or that reader can overwrite another child's unconsumed head.
-          // No aliases are projected again until this call returns, so this is
-          // needed only before the first refill in the current call.
+          // This call holds no aliases while count is zero; after its first
+          // output, the guard above prohibits any further refill. Restoring
+          // once before the first refill in this call is therefore sufficient.
           iter_param_->id_proj_expr_->locate_datums_for_update(
               *iter_param_->eval_ctx_, iter_param_->max_batch_size_);
           scan_datums_restored = true;
@@ -257,11 +253,6 @@ void ObTextDaaTIter::project_presence_results(const int64_t count)
 {
   ObEvalCtx &eval_ctx = *iter_param_->eval_ctx_;
   ObExpr &id_expr = *iter_param_->id_proj_expr_;
-  ObDatum *id_datums = id_expr.locate_batch_datums(eval_ctx);
-  const ObDatum *const *output_ids = presence_output_ids_.get_data();
-  for (int64_t i = 0; i < count; ++i) {
-    id_datums[i].set_datum(*output_ids[i]);
-  }
   id_expr.get_evaluated_flags(eval_ctx).set_all(count);
   id_expr.set_evaluated_projected(eval_ctx);
   if (iter_param_->need_project_relevance()) {

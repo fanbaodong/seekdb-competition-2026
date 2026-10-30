@@ -90,9 +90,17 @@ int compare_repeated_sort_key(const ObDatum &left, const ObDatum &right,
       || left.is_ext() || right.is_ext()) {
     return cmp_func(left, right, cmp, access_ctx);
   } else if (kind == KeyCompareKind::BINARY_STRING) {
-    const int64_t length = MIN(left.len_, right.len_);
-    const int bytes = length == 0 ? 0 : MEMCMP(left.ptr_, right.ptr_, length);
-    cmp = bytes != 0 ? bytes : (left.len_ < right.len_ ? -1 : left.len_ > right.len_ ? 1 : 0);
+    // Constant-sized byte comparisons can inline for common document IDs.
+    // Keep byte order and permit unaligned input; never compare native words.
+    if (left.len_ == 2 * sizeof(uint64_t) && right.len_ == 2 * sizeof(uint64_t)) {
+      cmp = MEMCMP(left.ptr_, right.ptr_, 2 * sizeof(uint64_t));
+    } else if (left.len_ == sizeof(uint64_t) && right.len_ == sizeof(uint64_t)) {
+      cmp = MEMCMP(left.ptr_, right.ptr_, sizeof(uint64_t));
+    } else {
+      const int64_t length = MIN(left.len_, right.len_);
+      const int bytes = length == 0 ? 0 : MEMCMP(left.ptr_, right.ptr_, length);
+      cmp = bytes != 0 ? bytes : (left.len_ < right.len_ ? -1 : left.len_ > right.len_ ? 1 : 0);
+    }
   } else if (kind == KeyCompareKind::UTF8_GENERAL_CI_STRING) {
     if (left.len_ == right.len_
         && (left.len_ == 0 || 0 == MEMCMP(left.ptr_, right.ptr_, left.len_))) {
