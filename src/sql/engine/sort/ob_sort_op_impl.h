@@ -466,6 +466,7 @@ public:
     // for hash_based sort of partition by in window function
     void set_cmp_range(const int64_t cmp_start, const int64_t cmp_end)
     {
+      OB_ASSERT(cmp_start >= 0 && cmp_start <= cmp_end && cmp_end <= cnt_);
       cmp_start_ = cmp_start;
       cmp_end_ = cmp_end;
     }

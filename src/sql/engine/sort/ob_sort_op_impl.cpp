@@ -30,6 +30,41 @@ namespace sql
 
 namespace
 {
+// utf8mb4_general_ci uses upper-case codepoint weights for ASCII and pads
+// shorter strings with spaces. Stop at the first non-ASCII codepoint so the
+// normal comparator continues to handle Unicode weights and invalid UTF-8.
+bool compare_ascii_general_ci(const ObDatum &left, const ObDatum &right, int &cmp)
+{
+  const unsigned char *l = reinterpret_cast<const unsigned char *>(left.ptr_);
+  const unsigned char *r = reinterpret_cast<const unsigned char *>(right.ptr_);
+  const int64_t length = MIN(left.len_, right.len_);
+  for (int64_t i = 0; i < length; ++i) {
+    if (OB_UNLIKELY((l[i] | r[i]) >= 0x80)) {
+      return false;
+    }
+    const unsigned char lc = l[i] >= 'a' && l[i] <= 'z' ? l[i] - ('a' - 'A') : l[i];
+    const unsigned char rc = r[i] >= 'a' && r[i] <= 'z' ? r[i] - ('a' - 'A') : r[i];
+    if (lc != rc) {
+      cmp = lc < rc ? -1 : 1;
+      return true;
+    }
+  }
+  const unsigned char *tail = left.len_ > right.len_ ? l : r;
+  const int64_t end = MAX(left.len_, right.len_);
+  const int sign = left.len_ > right.len_ ? 1 : -1;
+  for (int64_t i = length; i < end; ++i) {
+    if (tail[i] != ' ') {
+      if (OB_UNLIKELY(tail[i] >= 0x80)) {
+        return false;
+      }
+      cmp = tail[i] < ' ' ? -sign : sign;
+      return true;
+    }
+  }
+  cmp = 0;
+  return true;
+}
+
 // Repeated fulltext words are often byte-identical. Avoid decoding the same
 // UTF-8 word on every sort comparison. Match the comparator function itself,
 // so LOB locators, other data types and other collations retain their behavior.
@@ -45,10 +80,13 @@ int compare_repeated_sort_key(const ObDatum &left, const ObDatum &right,
     const int64_t length = MIN(left.len_, right.len_);
     const int bytes = length == 0 ? 0 : MEMCMP(left.ptr_, right.ptr_, length);
     cmp = bytes != 0 ? bytes : (left.len_ < right.len_ ? -1 : left.len_ > right.len_ ? 1 : 0);
-  } else if ((cmp_func == utf8->null_first_cmp_ || cmp_func == utf8->null_last_cmp_)
-             && left.len_ == right.len_
-             && (left.len_ == 0 || 0 == MEMCMP(left.ptr_, right.ptr_, left.len_))) {
-    cmp = 0;
+  } else if (cmp_func == utf8->null_first_cmp_ || cmp_func == utf8->null_last_cmp_) {
+    if (left.len_ == right.len_
+        && (left.len_ == 0 || 0 == MEMCMP(left.ptr_, right.ptr_, left.len_))) {
+      cmp = 0;
+    } else if (!compare_ascii_general_ci(left, right, cmp)) {
+      return cmp_func(left, right, cmp, access_ctx);
+    }
   } else {
     return cmp_func(left, right, cmp, access_ctx);
   }
@@ -397,7 +435,7 @@ int ObSortOpImpl::Compare::init(
   int ret = OB_SUCCESS;
   if (nullptr == sort_collations || nullptr == sort_cmp_funs || nullptr == exec_ctx) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (sort_cmp_funs->count() != sort_cmp_funs->count()) {
+  } else if (sort_collations->count() != sort_cmp_funs->count()) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(exec_ctx->get_datum_access_ctx(access_ctx_))) {
   } else {
@@ -444,13 +482,17 @@ bool ObSortOpImpl::Compare::operator()(
   } else {
     const ObDatum *lcells = l->cells();
     const ObDatum *rcells = r->cells();
+    // The immutable sort-key arrays are validated at init. Avoid repeating
+    // array bounds checks for every key of every pair of rows.
+    const ObSortFieldCollation *collations = sort_collations_->get_data();
+    const ObSortCmpFunc *cmp_funcs = sort_cmp_funs_->get_data();
     int cmp = 0;
     for (int64_t i = cmp_start_; 0 == cmp && i < cmp_end_ && OB_SUCC(ret); i++) {
-      const ObSortFieldCollation& sort_collation = sort_collations_->at(i);
+      const ObSortFieldCollation& sort_collation = collations[i];
       const int64_t idx = sort_collation.field_idx_;
       if (OB_FAIL(
               compare_repeated_sort_key(lcells[idx], rcells[idx],
-                                        sort_cmp_funs_->at(i).cmp_func_, cmp, access_ctx_))) {
+                                        cmp_funcs[i].cmp_func_, cmp, access_ctx_))) {
       } else if (cmp < 0) {
         less = sort_collation.is_ascending_;
       } else if (cmp > 0) {

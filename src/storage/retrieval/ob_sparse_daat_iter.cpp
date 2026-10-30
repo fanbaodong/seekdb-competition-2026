@@ -27,6 +27,8 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
+    iter_id_count_(0),
+    binary_ids_(false),
     is_inited_(false)
 {
 }
@@ -39,9 +41,14 @@ int ObSRMergeCmp::init(
   if (OB_ISNULL(iter_ids)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    iter_ids_ = iter_ids;
+    // The fixed array is allocated before the merger and never resized while
+    // the merger is active. Keep its view here, retaining the index assertion
+    // without repeating the array's virtual debug access check per comparison.
+    iter_ids_ = iter_ids->get_data();
+    iter_id_count_ = iter_ids->count();
     common::ObDatumBasicFuncs *basic_funcs = ObDatumFuncs::get_basic_func(id_meta.type_, id_meta.cs_type_);
     cmp_func_ = retrieval_id_cmp(basic_funcs);
+    binary_ids_ = cmp_func_ == compare_binary_retrieval_id;
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -61,9 +68,13 @@ int ObSRMergeCmp::cmp(
     ret = OB_NOT_INIT;
   } else {
     int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
-    } else {
+    const ObDatum &lhs = get_id_datum(l.iter_idx_);
+    const ObDatum &rhs = get_id_datum(r.iter_idx_);
+    // A direct call allows the fixed-length binary comparison to be inlined.
+    // The helper retains the original NULL and extend-datum fallbacks.
+    ret = binary_ids_ ? compare_binary_retrieval_id(lhs, rhs, tmp_ret, nullptr)
+                      : cmp_func_(lhs, rhs, tmp_ret, nullptr);
+    if (OB_SUCC(ret)) {
       cmp_ret = tmp_ret;
     }
   }
