@@ -47,7 +47,14 @@ seekdb_cuvs_build
 seekdb_cuvs_search
 seekdb_cuvs_free
 seekdb_cuvs_cagra_knn
+seekdb_cuvs_get_graph
+seekdb_cuvs_load
 ```
+
+Snapshots persist only the pruned CAGRA graph (`seekdb_cuvs_get_graph`);
+on load, the index is rebuilt from graph + vectors via
+`cuvsCagraIndexFromArgs` (`seekdb_cuvs_load`), so the dataset is never
+written twice into the LOB stream.
 
 Build seekdb with the resulting library:
 

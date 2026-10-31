@@ -23,8 +23,21 @@ void* seekdb_cuvs_build(const float* base, long n, long dim);
 int   seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
                          unsigned int* out_ids, float* out_dist);
 void  seekdb_cuvs_free(void* handle);
-int seekdb_cuvs_serialize(void* handle, const char* filename);
-void* seekdb_cuvs_deserialize(const char* filename, long n, long dim);
+
+/* Graph snapshot (OBCUVS03): seekdb persists the pruned CAGRA graph (n x degree
+ * uint32, row-major) next to the ids and fp32 vectors it already stores. The
+ * dataset is NOT duplicated inside the graph blob. On load the index is
+ * reconstructed with cuvsCagraIndexFromArgs, which copies graph+dataset to the
+ * device, so the caller may free its buffers once seekdb_cuvs_load returns.
+ *  - seekdb_cuvs_get_graph: returns the actual graph degree (cuVS may round the
+ *    requested degree), or -1 on error. With host_graph != NULL also copies the
+ *    graph device->host into host_graph[n*degree]. Call with NULL first to size
+ *    the buffer.
+ *  - seekdb_cuvs_load: builds a searchable index from a host graph + fp32
+ *    vectors, returns an opaque handle (NULL on error). */
+long  seekdb_cuvs_get_graph(void* handle, uint32_t* host_graph, long n);
+void* seekdb_cuvs_load(const uint32_t* graph, long n, long degree,
+                       const float* vecs, long dim);
 #ifdef __cplusplus
 }
 #endif

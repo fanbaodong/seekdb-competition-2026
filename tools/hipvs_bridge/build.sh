@@ -7,6 +7,12 @@ HIPVS_ROOT=${HIPVS_ROOT:-/opt/hipvs}
 ROCM_ROOT=${ROCM_ROOT:-/opt/rocm}
 HIPCC=${HIPCC:-$ROCM_ROOT/bin/hipcc}
 OUTPUT=${1:-$SCRIPT_DIR/libseekdb_cuvs_bridge.so}
+BUILD_BENCH=0
+for arg in "$@"; do
+  if [[ "$arg" == "--bench" ]]; then
+    BUILD_BENCH=1
+  fi
+done
 
 [[ -x "$HIPCC" ]] || { echo "hipcc is not executable: $HIPCC" >&2; exit 2; }
 [[ -f "$HIPVS_ROOT/include/cuvs/core/c_api.h" ]] || {
@@ -35,3 +41,28 @@ mkdir -p "$(dirname "$OUTPUT")"
   -o "$OUTPUT"
 
 echo "built $OUTPUT"
+
+if [[ "$BUILD_BENCH" == "1" ]]; then
+  OUT_DIR=$(dirname "$OUTPUT")
+  "$HIPCC" \
+    -O2 \
+    -D__HIP_PLATFORM_AMD__ \
+    -I"$HIPVS_ROOT/include" \
+    -I"$ROCM_ROOT/include" \
+    "$SCRIPT_DIR/bench_cagra.cpp" \
+    -L"$HIPVS_ROOT/lib" -L"$OUT_DIR" \
+    -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib:$OUT_DIR" \
+    -lcuvs_c -lseekdb_cuvs_bridge \
+    -o "$OUT_DIR/bench_cagra"
+  "$HIPCC" \
+    -O2 \
+    -D__HIP_PLATFORM_AMD__ \
+    -I"$HIPVS_ROOT/include" \
+    -I"$ROCM_ROOT/include" \
+    "$SCRIPT_DIR/test_persistence.cpp" \
+    -L"$HIPVS_ROOT/lib" -L"$OUT_DIR" \
+    -Wl,-rpath,"$HIPVS_ROOT/lib:$ROCM_ROOT/lib:$OUT_DIR" \
+    -lcuvs_c -lseekdb_cuvs_bridge \
+    -o "$OUT_DIR/test_persistence"
+  echo "built $OUT_DIR/bench_cagra $OUT_DIR/test_persistence"
+fi
