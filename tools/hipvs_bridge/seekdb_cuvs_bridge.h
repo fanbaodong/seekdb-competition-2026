@@ -1,5 +1,6 @@
 #ifndef SEEKDB_CUVS_BRIDGE_H
 #define SEEKDB_CUVS_BRIDGE_H
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
